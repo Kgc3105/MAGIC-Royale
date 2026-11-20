@@ -1,0 +1,7 @@
+.git
+node_modules
+mechfight-kit
+analysis
+tools
+protocol.md
+*.md

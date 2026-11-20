@@ -1,0 +1,14 @@
+{
+  "name": "magic-royale",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "sim": "node tools/sim.ts",
+    "check": "python mechfight-kit/check/check.py -- node bot.ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "typescript": "5.7.2"
+  }
+}
