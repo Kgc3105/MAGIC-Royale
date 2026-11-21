@@ -7,4 +7,8 @@ COPY bot.ts mechfight.ts package.json ./
 COPY src ./src
 # Bundle to one file at build time: a broken import or syntax error fails the build, not the match.
 RUN bun build /bot/bot.ts --target=bun --outfile=/bot/bot.js
+# The match gives us one CPU. Left to itself the runtime compiles and collects garbage on extra
+# threads, which can use up that allowance and freeze the bot for tens of milliseconds, long enough
+# to miss a 50 ms answer. Compile on the main thread, skip the slowest compiler tier, one GC marker.
+ENV BUN_JSC_useConcurrentJIT=0 BUN_JSC_useFTLJIT=0 BUN_JSC_numberOfGCMarkers=1
 ENTRYPOINT ["bun", "/bot/bot.js"]

@@ -384,7 +384,7 @@ class Dummy {
 }
 
 // ------------------------------------------------------------------------------------------ match
-type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number> }
+type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number>; src: Record<string, number>; activeEnd: number; killT: number[] }
 
 function runMatch(seed: number): Result {
   const rnd = mulberry32(seed * 7919 + 17)
@@ -477,6 +477,9 @@ function runMatch(seed: number): Result {
   let laserT = -1
   let gs = 0, gh = 0, ls = 0, lh = 0, losT = 0, conT = 0
   const lz2 = { auto: 0, autoHit: 0, rel: 0, relHit: 0, relBlocked: 0, relOffAim: 0 }
+  const src: Record<string, number> = {}
+  const killT: number[] = []
+  let activeEnd = 0
   let decTicks = 0
   let stillTicks = 0
   let deadBeforeMe = 0
@@ -522,7 +525,12 @@ function runMatch(seed: number): Result {
     if (v.id === 0) {
       events.push({ type: "damaged", amount: a, weapon, bearing: weapon === "zone" ? null : bearing, by: by ? by.id : null, ...(rear ? { rear: true } : {}) })
       if (weapon === "zone") zoneDmg += a
-      else taken += a
+      else {
+        taken += a
+        const sk = by?.ai ? (Object.entries(SKILLS).find(([, v]) => v === by.ai!.skill)?.[0] ?? "?") : "?"
+        src[`${sk}/${weapon}`] = (src[`${sk}/${weapon}`] ?? 0) + a
+        if (rear) src.rear = (src.rear ?? 0) + a
+      }
     }
     if (by && by.id === 0) {
       events.push({ type: "hit", target: v.id, amount: a, weapon })
@@ -535,6 +543,7 @@ function runMatch(seed: number): Result {
       v.diedAt = t
       if (by && by.id === 0) {
         kills++
+        killT.push(t)
         events.push({ type: "kill", target: v.id })
       }
       for (let k = 0; k < v.cubes + (Number(cfg.cubes.death_drop_extra) || 0); k++) cubes.push({ id: nextId++, kind: "cube", x: v.x + gauss() * 2, y: v.y + gauss() * 2, z: v.z, hp: 0 })
@@ -971,7 +980,10 @@ function runMatch(seed: number): Result {
         d.progress = 0
       }
     }
-    if (!me.alive) deadBeforeMe = mechs.filter((m) => m.ai && !m.alive).length
+    if (!me.alive) {
+      deadBeforeMe = mechs.filter((m) => m.ai && !m.alive).length
+      activeEnd = mechs.filter((m) => m.ai && m.alive && m.ai.active).length
+    }
     t += DT
     tick++
     if (mechs.filter((m) => m.alive).length <= 1 && SCENARIO !== "nav") break
@@ -980,7 +992,7 @@ function runMatch(seed: number): Result {
   times.sort((a, b) => a - b)
   return {
     score: deadBeforeMe, t, hp: Math.max(0, me.hp), kills, dealt, taken, zoneDmg, cubes: me.cubes, weapons: me.weapons.map((w) => w?.kind ?? "-").join("+"), stuck,
-    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2,
+    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2, src, activeEnd, killT,
   }
 }
 
@@ -1001,6 +1013,12 @@ const pct = (a: number, b: number) => ((100 * a) / Math.max(1, b)).toFixed(0)
 console.log(
   `shooting: gun ${sum((r) => r.gh)}/${sum((r) => r.gs)} hits (${pct(sum((r) => r.gh), sum((r) => r.gs))}%), ${(sum((r) => r.gs) / all.length).toFixed(0)} shots a match | laser ${sum((r) => r.lh)}/${sum((r) => r.ls)} hits (${pct(sum((r) => r.lh), sum((r) => r.ls))}%), ${(sum((r) => r.ls) / all.length).toFixed(1)} shots a match | enemy listed ${(sum((r) => r.conT) / all.length / 10).toFixed(0)}s a match, clear line ${pct(sum((r) => r.losT), sum((r) => r.conT))}% of that`,
 )
+{
+  const tot: Record<string, number> = {}
+  for (const r of all) for (const [k, v] of Object.entries(r.src)) tot[k] = (tot[k] ?? 0) + v
+  const allDmg = Object.entries(tot).filter(([k]) => k !== 'rear').reduce((a, [, v]) => a + v, 0)
+  console.log(`damage taken by source: ${Object.entries(tot).filter(([k]) => k !== 'rear').sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${pct(v, allDmg)}%`).join(', ')} | from behind ${pct(tot.rear ?? 0, allDmg)}% | hunters on us at death ${mean((r) => r.activeEnd).toFixed(1)} | kill times ${[0, 1, 2, 3, 4, 5].map((i) => { const v = all.filter((r) => r.killT.length > i).map((r) => r.killT[i]); return v.length ? `#${i + 1}@${(v.reduce((a, b) => a + b, 0) / v.length).toFixed(0)}s(${v.length})` : '' }).join(' ')}`)
+}
 console.log(`laser detail: released ${sum((r) => r.lz2.rel)} (hit ${sum((r) => r.lz2.relHit)}, wall in the way ${sum((r) => r.lz2.relBlocked)}, off aim ${sum((r) => r.lz2.relOffAim)}) | fired itself after the hold ${sum((r) => r.lz2.auto)} (hit ${sum((r) => r.lz2.autoHit)})`)
 console.log(
   `\n${SCENARIO}: ${all.length} matches | mean outlived ${mean((r) => r.score).toFixed(2)} | mean survival ${mean((r) => r.t).toFixed(0)}s | kills ${mean((r) => r.kills).toFixed(2)} | dealt ${mean((r) => r.dealt).toFixed(0)} taken ${mean((r) => r.taken).toFixed(0)} zone dmg ${mean((r) => r.zoneDmg).toFixed(0)} | cubes ${mean((r) => r.cubes).toFixed(1)} | laser ${(100 * mean((r) => (r.laserT >= 0 ? 1 : 0))).toFixed(0)}% @${(all.filter((r) => r.laserT >= 0).reduce((a, r) => a + r.laserT, 0) / Math.max(1, all.filter((r) => r.laserT >= 0).length)).toFixed(0)}s | in sight ${(100 * mean((r) => r.seen)).toFixed(0)}% | stuck ${mean((r) => r.stuck).toFixed(2)} | worst decision ${Math.max(...all.map((r) => r.msMax)).toFixed(1)} ms | errors ${all.reduce((s, r) => s + r.err, 0)}`,

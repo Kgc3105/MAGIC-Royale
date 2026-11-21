@@ -109,6 +109,11 @@ export class Nav {
     }
   }
 
+  /** forget every temporary block */
+  clearBlocks() {
+    this.tmp.fill(-1)
+  }
+
   /** nearest walkable cell to a world point within maxRing cells, or -1 */
   nearestWalkable(x: number, y: number, maxRing: number): number {
     const c0 = this.cellOf(x, y)

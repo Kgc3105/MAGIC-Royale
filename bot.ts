@@ -2,6 +2,9 @@
 import { type BotAction, type Hello, log, type Observation, run } from "./mechfight.ts"
 import { Brain } from "./src/brain.ts"
 
+/** set MECH_SLOW_MS=8 to log every decision slower than that (local profiling only) */
+const SLOW_LOG = Number((typeof process !== "undefined" && process.env?.MECH_SLOW_MS) || 0)
+
 /** Minimal behaviour used only if the real bot fails: head for the zone and shoot what is in sight. */
 function fallback(obs: Observation): BotAction {
   const me = obs.self
@@ -42,7 +45,12 @@ run((hello: Hello) => {
     act(obs: Observation): BotAction {
       if (brain) {
         try {
-          return brain.act(obs)
+          if (!SLOW_LOG) return brain.act(obs)
+          const t0 = performance.now()
+          const a = brain.act(obs)
+          const dt = performance.now() - t0
+          if (dt > SLOW_LOG) log(`slow tick ${obs.tick} t=${obs.t}: ${dt.toFixed(1)} ms mode=${brain.mode} astar=${brain.nav.lastExpanded} mechs=${obs.mechs.length}`)
+          return a
         } catch (e) {
           if (++errors <= 5 || errors % 200 === 0) log(`act failed at tick ${obs.tick} (${errors}):`, e)
         }

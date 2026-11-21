@@ -76,6 +76,20 @@ const UPGRADE_ORDER = [
   "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
 const CAMP_DEFAULT = "0"
+/** numeric overrides for local experiments: MECH_TUNE='{"lmin":100}' */
+const TUNE: Record<string, number> = (() => {
+  try {
+    return JSON.parse((typeof process !== "undefined" && process.env?.MECH_TUNE) || "{}")
+  } catch {
+    return {}
+  }
+})()
+const tv = (k: string, d: number) => (typeof TUNE[k] === "number" ? TUNE[k] : d)
+const envFlag = (name: string, dflt: string) => ((typeof process !== "undefined" && process.env?.[name]) || dflt) === "1"
+/** rehearse decisions before the match so the runtime compiles them early; MECH_REHEARSE=0/1 */
+const REHEARSE = envFlag("MECH_REHEARSE", "1")
+/** go for a supply drop even with mechs in contact; MECH_DROP=0/1 overrides for local testing */
+const DROP_UNDER_FIRE = envFlag("MECH_DROP", "0")
 /** keep charging the laser while running from several mechs; MECH_RUNCHARGE=0/1 overrides for local testing */
 const CHARGE_ON_RUN = ((typeof process !== "undefined" && process.env?.MECH_RUNCHARGE) || "1") === "1"
 /** "auto" picks the posture from what the match looks like; the others force one (for local testing) */
@@ -158,12 +172,92 @@ export class Brain {
   private zStatic = false
   private lastSawTargetT = -1e9
 
-  constructor(hello: Hello) {
+  constructor(hello: Hello, shared?: { world: World; nav: Nav }) {
     this.cfg = hello.config
-    this.world = new World(hello.map.dir, hello.map.files)
-    this.nav = new Nav(this.world)
+    this.world = shared?.world ?? new World(hello.map.dir, hello.map.files)
+    this.nav = shared?.nav ?? new Nav(this.world)
     this.rng = mulberry32((hello.seed ^ 0x9e3779b9) >>> 0)
-    this.warmUp()
+    if (!shared) {
+      this.warmUp()
+      try {
+        if (REHEARSE) this.rehearse(hello)
+      } catch {
+        // rehearsal is only for speed; never let it stop the bot starting
+      }
+      // the throwaway copy shared our navigator: drop anything it marked as blocked
+      this.nav.clearBlocks()
+      this.nav.now = 0
+    }
+  }
+
+  /**
+   * Play a few hundred made-up decisions on a throwaway copy of ourselves before the match starts.
+   * With one CPU, the runtime compiling the decision code mid-match shows up as a slow answer;
+   * doing it here spends the start-up budget instead.
+   */
+  private rehearse(hello: Hello) {
+    const w = this.world
+    const cfg = this.cfg
+    const t0 = performance.now()
+    const rnd = mulberry32(777)
+    const spot = (): [number, number] => {
+      for (let k = 0; k < 50; k++) {
+        const px = w.bMinX + 60 + rnd() * (w.bMaxX - w.bMinX - 120)
+        const py = w.bMinY + 60 + rnd() * (w.bMaxY - w.bMinY - 120)
+        if (this.nav.clearAt(px, py) > 4) return [px, py]
+      }
+      return [cfg.zone.start_center[0], cfg.zone.start_center[1]]
+    }
+    const kinds = ["laser", "lightning", "mortar"] as const
+    const wstats = cfg.weapons as unknown as Record<string, Record<string, number>>
+    const ph = cfg.zone.phases[0]
+    for (let round = 0; round < 6 && performance.now() - t0 < 2500; round++) {
+      const twin = new Brain(hello, { world: w, nav: this.nav })
+      let [x, y] = spot()
+      const second = round === 0 ? null : kinds[round % 3]
+      const foes = Array.from({ length: round % 4 }, (_, i) => ({ id: 1 + i, p: spot(), w: kinds[(round + i) % 3] }))
+      for (const f of foes) {
+        const a = rnd() * TAU
+        const r = 40 + rnd() * 150
+        f.p = [x + Math.cos(a) * r, y + Math.sin(a) * r]
+      }
+      for (let i = 0; i < 70 && performance.now() - t0 < 2500; i++) {
+        const t = i * 0.1
+        const z = w.groundAt(x, y)
+        const hp = cfg.mech.hp * (round % 2 ? 0.3 + 0.7 * rnd() : 1)
+        const obs = {
+          type: "obs", tick: i * 2, t, alive: 16 - (round > 3 ? 4 : 0),
+          self: {
+            id: 0, pos: [x, y, z], vel: [rnd() * 10 - 5, rnd() * 10 - 5, 0], aim: [rnd() * 6 - 3, 0], hp, max_hp: cfg.mech.hp, energy: 100 * rnd(), max_energy: cfg.mech.energy,
+            grounded: true, cubes: round, upgrades: [], in_zone: round !== 5,
+            weapons: [
+              { kind: "gun", cooldown: 0, ammo: i % 13, reload: 0, stats: wstats.gun },
+              second ? { kind: second, cooldown: 0, ...(second === "laser" ? { charge: (i % 9) * 0.1 } : {}), stats: wstats[second] } : null,
+            ],
+            stats: cfg.mech,
+          },
+          mechs: foes.map((f) => ({ id: f.id, kind: "mech", pos: [f.p[0], f.p[1], w.groundAt(f.p[0], f.p[1])], vel: [rnd() * 20 - 10, rnd() * 20 - 10, 0], aim: [rnd() * 6 - 3, 0], hp: 300 + rnd() * 1100, max_hp: 1400, cubes: 0, weapons: ["gun", f.w], charging: i % 7 === 0 })),
+          projectiles: foes.slice(0, 2).map((f, k) => ({ id: 900 + k, kind: k ? "mortar" : "gun", pos: [f.p[0], f.p[1], z + 7], vel: [(x - f.p[0]) * 1.5, (y - f.p[1]) * 1.5, k ? 20 : 0] })),
+          crates: [{ id: 1000, pos: [x + 30, y + 10, w.groundAt(x + 30, y + 10)], hp: 300 }],
+          cubes: i % 3 ? [{ id: 5000, pos: [x - 20, y + 15, w.groundAt(x - 20, y + 15)] }] : [],
+          pickups: [{ id: 8000, kind: kinds[i % 3], pos: [x + 40, y - 30, w.groundAt(x + 40, y - 30)] }],
+          sounds: i % 5 ? [] : [{ kind: "step", bearing: 1, dist: "near", age: 0.05 }],
+          beams: [],
+          events: i % 6 || !foes.length ? [] : [{ type: "damaged", amount: 45, weapon: "gun", bearing: rnd() * 6 - 3, by: foes[0].id }],
+          zone: { center: cfg.zone.start_center, radius: cfg.zone.start_radius, next_center: [cfg.zone.start_center[0] - 60, cfg.zone.start_center[1] + 60], next_radius: ph.radius, shrink_start: ph.hold_s, shrink_end: ph.hold_s + ph.shrink_s, dps: ph.dps },
+          offer: i === 10 ? { id: 1, expires: t + 5, choices: cfg.upgrades.slice(0, 3).map((u) => ({ id: u.id, name: u.name, desc: u.desc })) } : null,
+          drops: round === 4 ? [{ id: 20000, pos: [x + 50, y + 50, z], radius: 8, lands_in: 5, capture_s: 4, progress: 0, holder: null }] : [],
+        } as unknown as Observation
+        const a = twin.act(obs)
+        const mv = a.move ?? [0, 0]
+        const nx = x + mv[0] * 1.1
+        const ny = y + mv[1] * 1.1
+        if (this.nav.clearAt(nx, ny) > 3) {
+          x = nx
+          y = ny
+        }
+      }
+    }
   }
 
   /** run the hot paths a few times so the JIT has compiled them before the first real decision */
@@ -524,9 +618,9 @@ export class Brain {
       // practice squad: they never fight each other, so a house bot only dies if we kill it.
       // Take the fight while healthy, break off when losing.
       if (!hide) {
-        if (nT > 0 && hpFrac < 0.4 && !finishable) hide = true
-        if (nT >= 3) hide = true
-        if (nT === 2 && hpFrac < 0.65) hide = true
+        if (nT > 0 && hpFrac < tv("evHp", 0.4) && !finishable) hide = true
+        if (nT >= tv("evN", 3)) hide = true
+        if (nT === 2 && hpFrac < tv("evHp2", 0.65)) hide = true
         if (unseenShooter && underFire && !tk0) hide = true
         if (outgunned && hpFrac < 0.8 && !finishable) hide = true
       } else if ((nT === 0 && (hpFrac > 0.75 || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > 0.85 && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
@@ -634,13 +728,28 @@ export class Brain {
       const ky = cell >= 0 && !this.nav.free(zn.next_center[0], zn.next_center[1], 0.5) ? this.nav.cellY(cell) : zn.next_center[1]
       return { x: kx, y: ky, arrive: 0.5, why: "king", boost: dist2(x, y, kx, ky) > zn.next_radius + 10, travel: true }
     }
+    // ---- a supply drop is a second life (full repair, full energy, 3 cubes): go for it under fire.
+    // It only needs us alone in its ring for a few seconds; being shot at does not stop the capture.
+    if (DROP_UNDER_FIRE && c.threats.length > 0) {
+      for (const d of obs.drops) {
+        if (skip(d.id)) continue
+        const dd = dist2(x, y, d.pos[0], d.pos[1])
+        if (dd > 240) continue
+        // set off in time to be standing there when it lands, not earlier
+        if (d.lands_in > dd / (c.walk * 0.75) + 6) continue
+        if (d.holder != null && d.holder !== me.id && d.progress > 1.5) continue
+        if (dd > 8 && !chase(d.id, dd, 16)) continue
+        return { x: d.pos[0], y: d.pos[1], arrive: 2.5, why: "grab-drop", boost: dd > 30 && me.energy > 35, travel: true }
+      }
+    }
+
     // ---- power beats position. A laser is worth about a kill a match and every cube is 4% more HP
     // and damage, so with a mech about we still go for one that is close (the torso keeps shooting).
-    if (c.threats.length > 0 && c.hpFrac > 0.35) {
+    if (c.threats.length > 0 && c.hpFrac > tv("grabHp", 0.35)) {
       // not something an enemy is standing nearer to than we are
       const contested = (px: number, py: number, d: number) => c.threats.some((k) => dist2(px, py, k.x, k.y) + 10 < d)
       let gc: Item | null = null
-      let gd = c.ambush ? 25 : 45
+      let gd = c.ambush ? 25 : tv("grabR", 45)
       for (const it of this.cubes.values()) {
         if (it.roof || skip(it.id) || !okSpot(it.x, it.y)) continue
         const d = dist2(x, y, it.x, it.y)
@@ -677,11 +786,11 @@ export class Brain {
       if (c.fight && c.target) {
         const k = c.target
         const d = dist2(x, y, k.x, k.y)
-        let rmin = 45
-        let rmax = 85
+        let rmin = tv("gmin", 45)
+        let rmax = tv("gmax", 85)
         if (c.sLaser >= 0) {
-          rmin = 70
-          rmax = 140
+          rmin = tv("lmin", 125)
+          rmax = tv("lmax", 185)
         } else if (c.sLight >= 0 && me.energy > 25) {
           rmin = 12
           rmax = 36
@@ -696,9 +805,8 @@ export class Brain {
         const inZone = dist2(k.x, k.y, zn.next_center[0], zn.next_center[1]) < zn.next_radius + 20 || t < zn.shrink_start - 25
         if (d > rmax + 4 && !lost && inZone) return { x: k.x, y: k.y, arrive: rmax, why: "fight-close", boost: false, travel: true }
         if (d < rmin - 4 && d > 0.5) {
-          const bx = x + ((x - k.x) / d) * 18
-          const by = y + ((y - k.y) / d) * 18
-          if (this.nav.free(bx, by) && dist2(bx, by, c.zone.cx, c.zone.cy) < c.zone.r - 6) return { x: bx, y: by, arrive: 2, why: "fight-back", boost: false, travel: false }
+          const back = this.retreatPoint(obs, c, k)
+          if (back) return { x: back[0], y: back[1], arrive: 2, why: "fight-back", boost: d < rmin - tv("kboost", 15) && me.energy > 45, travel: false }
         }
         return { ...stay, why: "fight" }
       }
@@ -786,6 +894,34 @@ export class Brain {
     const [hx, hy] = this.homePoint(obs, c)
     const [ix, iy] = this.idleSpot(hx, hy, zn)
     return { x: ix, y: iy, arrive: 2, why: "home", boost: false, travel: true }
+  }
+
+  /** a reachable spot a short walk away that opens the distance to the target (and the other mechs) */
+  private retreatPoint(obs: Observation, c: Ctx, k: Aimable): [number, number] | null {
+    const { x, y, t } = c
+    const soon = this.zoneAt(obs, t + 5)
+    const zn = obs.zone
+    const late = t > zn.shrink_start - 25
+    let best = -1e9
+    let out: [number, number] | null = null
+    for (const r of [22, 38]) {
+      for (let i = 0; i < NDIR; i++) {
+        const px = x + DIRX[i] * r
+        const py = y + DIRY[i] * r
+        if (!this.nav.free(px, py) || !this.nav.segOk(x, y, px, py)) continue
+        if (dist2(px, py, soon.cx, soon.cy) > soon.r - 8) continue
+        if (late && dist2(px, py, zn.next_center[0], zn.next_center[1]) > zn.next_radius - 6) continue
+        let s = dist2(px, py, k.x, k.y)
+        let near = Infinity
+        for (const th of c.threats) if (th.id !== k.id) near = Math.min(near, dist2(px, py, th.x, th.y))
+        if (near < 90) s -= (90 - near) * 0.8
+        if (s > best) {
+          best = s
+          out = [px, py]
+        }
+      }
+    }
+    return out && best > dist2(x, y, k.x, k.y) + 6 ? out : null
   }
 
   /** value of swapping/adding this pickup kind; <= 0 means leave it */
@@ -1013,7 +1149,7 @@ export class Brain {
     // the zone outranks cover: outside it we cannot repair and it only gets worse
     const forced = goal.why === "zone" || goal.why === "king"
     const grabbing = goal.why.startsWith("grab")
-    const goalW = forced ? 4 : grabbing ? 2.5 : 1
+    const goalW = forced ? 4 : grabbing ? 2.5 : goal.why === "fight-back" ? tv("kw", 2.5) : 1
     const coverW = forced ? 0.3 : grabbing ? 0.5 : 1
     const mechTarget = c.target && c.target.kind === "mech" ? c.target : null
     const tk = c.cover ? (c.fight || c.evade ? mechTarget : null) : c.fight ? mechTarget : null
@@ -1024,7 +1160,7 @@ export class Brain {
     if (tk) {
       if (t >= this.strafeFlipT) {
         this.strafe = -this.strafe
-        this.strafeFlipT = t + 0.45 + this.rng() * 0.7
+        this.strafeFlipT = t + tv("flipA", 0.45) + this.rng() * tv("flipB", 0.7)
       }
       const d = dist2(x, y, tk.x, tk.y)
       if (d > 0.5) {
