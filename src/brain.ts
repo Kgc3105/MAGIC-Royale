@@ -181,6 +181,7 @@ export class Brain {
   private hopFly = false
   private hopFlyT = 0
   private hopFails = 0
+  private fbOn = false
   private hopBan = -1e9
   private hopStartT = -1e9
   private hopSeenT = -1e9
@@ -642,6 +643,8 @@ export class Brain {
       if (los) exposed = true
       let s = -d / tv("tsD", 60) - (k.hp / Math.max(1, k.maxHp)) * tv("tsHp", 1.5) + (los ? tv("tsLos", 2.5) : 0)
       if (k.id === this.targetId) s += tv("tsStick", 0.6)
+      // same health, very different danger: a mech with a laser is the one to remove first
+      if (k.kind === "mech" && k.weapons.includes("laser")) s += tv("tsLaser", 0)
       if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) s += tv("tsAtk", 1)
       const away = Math.abs(wrap(Math.atan2(y - k.y, x - k.x) - k.yaw)) > 1.3
       if (away && tv("tp", 0) > 0) s += 1.2 + (1 - k.hp / Math.max(1, k.maxHp))
@@ -667,7 +670,10 @@ export class Brain {
     // a laser out-trades a gun at range: do not trade with one unless we hold one too
     const outgunned = !!tk0 && tk0.weapons.includes("laser") && sLaser < 0 && targetDist > 55
     const ambush = this.ambushStance()
-    const camp = !ambush && CAMP && sLaser >= 0
+    // stage switch: hunters with only a gun can be fought in the open (their fire is dodged at range);
+    // once enough laser-armed ones are on us, fight from behind cover and lean out to shoot
+    const laserFoes = tv("campL", 0) > 0 ? threats.filter((k) => k.weapons.includes("laser")).length : 0
+    const camp = !ambush && sLaser >= tv("campNeed", 0) && (CAMP || (tv("campL", 0) > 0 && laserFoes >= tv("campL", 0)))
     const hurtByMech = this.lastHurtBy >= 0 && this.lastHurtBy < 100 && t - this.lastHurtT < 4
     let hide = this.evading
     let fight: boolean
@@ -1532,6 +1538,14 @@ export class Brain {
     const charging = !!laser && (laser.charge ?? 0) > 0
     const onGround = z - w.groundAt(x, y) < 3
     let boost = goal.boost && me.energy > 6 && !charging
+    // sprint through a gun fight: bullets that would hit a walking mech miss a sprinting one.
+    // Runs the energy down to a floor, then waits for it to come back.
+    if (!boost && (!charging || tv("fboostCh", 0) > 0) && tv("fboost", 0) > 0 && c.fight && c.exposed && c.threats.length >= tv("fboostN", 1)) {
+      if (this.fbOn) {
+        if (me.energy < tv("fboostLo", 15)) this.fbOn = false
+      } else if (me.energy > tv("fboostHi", 45)) this.fbOn = true
+      if (this.fbOn) boost = true
+    }
     const speed = (boost ? (S.boost_speed ?? 19.5) : c.walk) * (charging ? (S.charge_move_mult ?? 0.5) : 1)
 
     const gdist = dist2(x, y, goal.x, goal.y)

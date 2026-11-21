@@ -39,6 +39,10 @@ const HUNT_DELAY = Number(args.get("delay") ?? 0)
 /** when every house bot joins the hunt regardless of kills (our guess at "late in the match") */
 const LATE_T = Number(args.get("late") ?? 255)
 const TRACE = args.has("trace")
+/** which house bot joins the hunt next: "skill" (weakest first, the model so far), "shuffle" (any skill at any time), "reverse" (strongest first) */
+const ORDER = args.get("order") ?? "skill"
+/** "all": every house bot carries a laser, whatever its skill */
+const LASERS = args.get("lasers") ?? "skill"
 /** no lasers lie on the map or come out of crates: the matches in which the bot never finds one */
 const NOLASER = args.has("nolaser")
 
@@ -431,12 +435,20 @@ function runMatch(seed: number): Result {
   const mechs: Mech[] = spawns.map((p, i) => mkMech(i, p[0], p[1]))
   const me = mechs[0]
   const skills = ["easy", "easy", "easy", "easy", "medium", "medium", "medium", "medium", "hard", "hard", "hard", "hard", "expert", "expert", "expert"]
+  if (ORDER === "reverse") skills.reverse()
+  else if (ORDER === "shuffle") {
+    const r2 = mulberry32((seed * 977 + 5) >>> 0)
+    for (let i = skills.length - 1; i > 0; i--) {
+      const j = Math.floor(r2() * (i + 1))
+      ;[skills[i], skills[j]] = [skills[j], skills[i]]
+    }
+  }
   for (let i = 1; i < mechs.length; i++) {
     const sk = SCENARIO === "duel" ? SKILL : skills[i - 1]
     mechs[i].ai = new Dummy(sk, seed * 131 + i)
     const a = rnd() * TAU
     mechs[i].ai!.home = [Math.cos(a), Math.sin(a)]
-    if (SKILLS[sk].laser) mechs[i].weapons[1] = mkWpn("laser")
+    if (SKILLS[sk].laser || LASERS === "all") mechs[i].weapons[1] = mkWpn("laser")
   }
   // loot
   const pickups: Loot[] = []
