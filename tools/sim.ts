@@ -29,6 +29,8 @@ const SEED0 = Number(args.get("seed") ?? 1)
 const VERBOSE = args.has("verbose")
 const SKILL = args.get("skill") ?? "medium"
 const STATIC_ZONE = args.has("static-zone")
+/** hunters always know where the bot is (the first, harsher model) instead of sharing vision */
+const OMNISCIENT = args.has("omniscient")
 const TRACE = args.has("trace")
 
 const hello0: Hello = JSON.parse(gunzipSync(readFileSync(`${decodeURIComponent(KIT)}/check/stream.jsonl.gz`)).toString("utf8").split("\n")[0])
@@ -251,6 +253,8 @@ class Dummy {
   noiseT = 0
   active = false
   home: [number, number] = [0, 0]
+  search: [number, number] | null = null
+  searchT = -1
   constructor(skill: string, seed: number) {
     this.skill = SKILLS[skill] ?? SKILLS.medium
     this.rnd = mulberry32(seed)
@@ -288,8 +292,38 @@ class Dummy {
     const al = Math.hypot(ax, ay)
     return al > 1e-6 ? [ax / al, ay / al] : [0, 0]
   }
-  decide(m: Mech, tgt: Mech | null, t: number, zone: { cx: number; cy: number; r: number; ncx: number; ncy: number; nr: number; hurry: boolean }): BotAction {
+  /**
+   * `seen`: some house bot can see the target right now (they share vision). Otherwise the hunter
+   * only has `believed`, the last place the squad saw it, and searches around there.
+   */
+  decide(m: Mech, tgt: Mech | null, t: number, zone: { cx: number; cy: number; r: number; ncx: number; ncy: number; nr: number; hurry: boolean }, seen = true, believed: [number, number] = [0, 0]): BotAction {
     const out: BotAction = { fire: [false, false] }
+    if (tgt && tgt.alive && this.active && !seen) {
+      const dzn0 = Math.hypot(m.x - zone.ncx, m.y - zone.ncy)
+      let gx = believed[0], gy = believed[1]
+      if (zone.hurry && dzn0 > zone.nr - 10) {
+        gx = zone.ncx
+        gy = zone.ncy
+      } else if (Math.hypot(gx - m.x, gy - m.y) < 18) {
+        if (!this.search || t > this.searchT || Math.hypot(this.search[0] - m.x, this.search[1] - m.y) < 6) {
+          this.search = null
+          for (let k = 0; k < 20 && !this.search; k++) {
+            const a = this.rnd() * TAU, r = 20 + this.rnd() * 55
+            const px = believed[0] + Math.cos(a) * r, py = believed[1] + Math.sin(a) * r
+            if (npcNav.free(px, py)) this.search = [px, py]
+          }
+          this.searchT = t + 8
+        }
+        if (this.search) {
+          gx = this.search[0]
+          gy = this.search[1]
+        }
+      }
+      out.move = this.walkTo(m, gx, gy, t)
+      const mv = Math.hypot(out.move[0], out.move[1])
+      out.aim = [(mv > 0.1 ? Math.atan2(out.move[1], out.move[0]) : m.yaw + 0.3) + 0.9 * Math.sin(t * 1.1 + m.id), 0]
+      return out
+    }
     const dzn = Math.hypot(m.x - zone.ncx, m.y - zone.ncy)
     if (zone.hurry && dzn > zone.nr - 10) {
       out.move = this.walkTo(m, zone.ncx, zone.ncy, t)
@@ -350,7 +384,7 @@ class Dummy {
 }
 
 // ------------------------------------------------------------------------------------------ match
-type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number }
+type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number }
 
 function runMatch(seed: number): Result {
   const rnd = mulberry32(seed * 7919 + 17)
@@ -425,6 +459,8 @@ function runMatch(seed: number): Result {
   }
   let next = pickNext(cur, phases[0].radius)
 
+  // what-if switches: start the bot with cubes or a weapon to measure how much they are worth
+  if (args.has("weapon")) me.weapons[1] = mkWpn(args.get("weapon")!)
   const brain = new Brain({ ...hello0, slot: 0, seed: seed * 2654435761 })
   const bullets: Bullet[] = []
   let beams: Observation["beams"] = []
@@ -435,6 +471,10 @@ function runMatch(seed: number): Result {
   const times: number[] = []
   const modes: Record<string, number> = {}
   let lastPos: [number, number] = [me.x, me.y]
+  let believed: [number, number] = [me.x, me.y]
+  let knownT = 0
+  let seenTicks = 0
+  let decTicks = 0
   let stillTicks = 0
   let deadBeforeMe = 0
 
@@ -526,6 +566,7 @@ function runMatch(seed: number): Result {
     return { cx: cur.cx + (next.cx - cur.cx) * f, cy: cur.cy + (next.cy - cur.cy) * f, r: cur.r + (next.r - cur.r) * f, ss, se: ss + p.shrink_s, dps: p.dps }
   }
 
+  for (let k = 0; k < Number(args.get("cubes") ?? 0); k++) giveCube(me, 0)
   let t = 0
   let tick = 0
   const maxT = cfg.match.duration_s
@@ -561,7 +602,45 @@ function runMatch(seed: number): Result {
         }
       }
       const hurry = t > lz.ss - 25
-      for (const m of aliveOthers) m.cmd = m.ai!.decide(m, me, t, { cx: lz.cx, cy: lz.cy, r: lz.r, ncx: next.cx, ncy: next.cy, nr: next.r, hurry })
+      // the squad shares what any of them sees; out of everyone's sight they only know where we were
+      let seenNow = OMNISCIENT
+      if (!seenNow) {
+        for (const m of aliveOthers) {
+          const d = Math.hypot(me.x - m.x, me.y - m.y)
+          if (d > cfg.vision.range) continue
+          if (d > cfg.vision.near_range && Math.abs(wrap(Math.atan2(me.y - m.y, me.x - m.x) - m.yaw)) > (cfg.vision.fov_deg * Math.PI) / 360) continue
+          const ez = m.z + m.stats.eye_height
+          if (world.losClear(m.x, m.y, ez, me.x, me.y, me.z + me.stats.height * 0.5) || world.losClear(m.x, m.y, ez, me.x, me.y, me.z + me.stats.height)) {
+            seenNow = true
+            break
+          }
+        }
+      }
+      if (seenNow) {
+        believed = [me.x, me.y]
+        knownT = t
+      }
+      const seen = seenNow || t - knownT < 1
+      if (seen) seenTicks++
+      decTicks++
+      const zinfo = { cx: lz.cx, cy: lz.cy, r: lz.r, ncx: next.cx, ncy: next.cy, nr: next.r, hurry }
+      if (SCENARIO === "ffa") {
+        // free-for-all: every scripted mech goes for the nearest other mech, us included
+        for (const m of aliveOthers) {
+          m.ai!.active = true
+          let tgt: Mech | null = null
+          let bd = 260
+          for (const o of mechs) {
+            if (o === m || !o.alive) continue
+            const d = Math.hypot(o.x - m.x, o.y - m.y)
+            if (d < bd) {
+              bd = d
+              tgt = o
+            }
+          }
+          m.cmd = m.ai!.decide(m, tgt, t, zinfo, true, believed)
+        }
+      } else for (const m of aliveOthers) m.cmd = m.ai!.decide(m, me, t, zinfo, seen, believed)
 
       // ---- our bot's observation
       const eye = me.z + me.stats.eye_height
@@ -854,7 +933,7 @@ function runMatch(seed: number): Result {
   times.sort((a, b) => a - b)
   return {
     score: deadBeforeMe, t, hp: Math.max(0, me.hp), kills, dealt, taken, zoneDmg, cubes: me.cubes, weapons: me.weapons.map((w) => w?.kind ?? "-").join("+"), stuck,
-    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled,
+    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0,
   }
 }
 
@@ -871,5 +950,5 @@ for (let k = 0; k < MATCHES; k++) {
 }
 const mean = (f: (r: Result) => number) => all.reduce((s, r) => s + f(r), 0) / Math.max(1, all.length)
 console.log(
-  `\n${SCENARIO}: ${all.length} matches | mean outlived ${mean((r) => r.score).toFixed(2)} | mean survival ${mean((r) => r.t).toFixed(0)}s | kills ${mean((r) => r.kills).toFixed(2)} | dealt ${mean((r) => r.dealt).toFixed(0)} taken ${mean((r) => r.taken).toFixed(0)} zone dmg ${mean((r) => r.zoneDmg).toFixed(0)} | stuck ${mean((r) => r.stuck).toFixed(2)} | worst decision ${Math.max(...all.map((r) => r.msMax)).toFixed(1)} ms | errors ${all.reduce((s, r) => s + r.err, 0)}`,
+  `\n${SCENARIO}: ${all.length} matches | mean outlived ${mean((r) => r.score).toFixed(2)} | mean survival ${mean((r) => r.t).toFixed(0)}s | kills ${mean((r) => r.kills).toFixed(2)} | dealt ${mean((r) => r.dealt).toFixed(0)} taken ${mean((r) => r.taken).toFixed(0)} zone dmg ${mean((r) => r.zoneDmg).toFixed(0)} | cubes ${mean((r) => r.cubes).toFixed(1)} | in sight ${(100 * mean((r) => r.seen)).toFixed(0)}% | stuck ${mean((r) => r.stuck).toFixed(2)} | worst decision ${Math.max(...all.map((r) => r.msMax)).toFixed(1)} ms | errors ${all.reduce((s, r) => s + r.err, 0)}`,
 )

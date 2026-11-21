@@ -9,7 +9,8 @@ A bot for the Builders Mech Royale track (`mechfight/1`): it pilots one mech in 
 - **Zone.** It heads for the next circle before the current one closes, and in the last phases goes to the exact centre, where every metre away costs HP.
 - **Fighting.** It leads gun shots, charges the laser and releases only when on target, steps out of cover when a weapon is ready and back in when none is, and dodges bullets and mortar shells it can see. A mech that shoots it from out of view is located from the hit's bearing or the beam.
 - **Surviving.** When outnumbered, out-gunned or low on HP it breaks line of sight, holds fire so repair can start, and comes back when healed.
-- **Growing.** It collects weapons (laser first), cubes, crates and supply drops when nobody is near, and takes HP and repair upgrades first.
+- **Growing.** It collects weapons (laser first), cubes, crates and supply drops, and takes HP and repair upgrades first. A cube or a laser close by is grabbed even mid-fight, because early power decides more than position does.
+- **Two postures.** Against the practice squad, which never fights itself, a house bot only dies if we kill it, so the bot takes fights while healthy. Once mechs start dying that it did not kill, the match is a free-for-all: it switches to hide-first, stays behind cover, and only trades shots with a mech that is close, is shooting it, or is nearly dead.
 
 ## Layout
 

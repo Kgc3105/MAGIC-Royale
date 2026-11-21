@@ -49,6 +49,8 @@ type Ctx = {
   king: boolean
   evade: boolean
   fight: boolean
+  /** hide-first posture (free-for-all) rather than take-the-fight posture (practice squad) */
+  ambush: boolean
   threats: Track[]
   target: Aimable | null
   targetLos: boolean
@@ -62,13 +64,15 @@ type Ctx = {
 }
 
 /** how much we like holding each weapon (the gun is never dropped) */
-const WEAPON_VALUE: Record<string, number> = { laser: 3, lightning: 2.2, gun: 2, mortar: 1 }
+const WEAPON_VALUE: Record<string, number> = { laser: 4, lightning: 2.4, gun: 2, mortar: 1.2 }
 /** upgrade preference, best first: survive the final burn, then win duels */
 const UPGRADE_ORDER = [
   "plating", "nanites", "armor", "servos", "laser_damage", "gun_damage", "jets", "reactor", "capacitor", "gun_rate", "laser_charge",
   "lightning_efficiency", "lightning_range", "lightning_chain", "gun_mag", "gun_velocity", "gyros", "sensors", "laser_pierce",
   "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
+/** "auto" picks the posture from what the match looks like; the others force one (for local testing) */
+const STANCE = (typeof process !== "undefined" && process.env?.MECH_STANCE) || "auto"
 const NDIR = 16
 const DIRX = new Float64Array(NDIR)
 const DIRY = new Float64Array(NDIR)
@@ -116,6 +120,13 @@ export class Brain {
   private coverX = NaN
   private coverY = NaN
   private coverT = -1e9
+  private coverPeek = false
+  /** the match looks like a free-for-all (mechs are dying that we did not kill) */
+  ffa = false
+  private myKills = 0
+  private chaseId = -1
+  private chaseBest = Infinity
+  private chaseT = 0
   private alertYaw = 0
   private alertUntil = -1
   private lastHurtT = -1e9
@@ -271,8 +282,14 @@ export class Brain {
       else if (e.type === "take_failed") {
         if (e.reason === "gone") this.pickups.delete(e.id)
         else this.ignore.set(e.id, t + (e.reason === "range" ? 1 : 20))
-      } else if (e.type === "kill") this.tracks.delete(e.target)
+      } else if (e.type === "kill") {
+        this.tracks.delete(e.target)
+        this.myKills++
+      }
     }
+    // Mechs dying that we did not kill means the others are fighting each other: a free-for-all.
+    // (The practice squad never fights itself; the margin allows for a zone or drone accident.)
+    if (!this.ffa && (this.cfg.match.mechs ?? 16) - obs.alive - this.myKills >= 3) this.ffa = true
     // someone close that we cannot see: look that way
     if (this.alertUntil < t) {
       for (const s of obs.sounds) {
@@ -355,28 +372,38 @@ export class Brain {
 
   /** a spot next to a wall near (hx,hy): cover is one step away when someone shows up */
   private idleSpot(hx: number, hy: number, z: Observation["zone"]): [number, number] {
-    const key = `${Math.round(hx / 10)},${Math.round(hy / 10)},${z.shrink_end}`
-    if (key === this.idleKey && Number.isFinite(this.idleX)) return [this.idleX, this.idleY]
+    // one resting spot per zone phase, kept for as long as it stays inside the next circle
+    const key = String(z.shrink_end)
+    if (key === this.idleKey && Number.isFinite(this.idleX) && dist2(this.idleX, this.idleY, z.next_center[0], z.next_center[1]) <= z.next_radius - 8) return [this.idleX, this.idleY]
     this.idleKey = key
+    const w = this.world
     let best = Infinity
     let bx = hx
     let by = hy
     const need = this.nav.need
-    for (let r = 0; r <= 44; r += 4) {
+    for (let r = 0; r <= 48; r += 6) {
       const n = r === 0 ? 1 : NDIR
       for (let k = 0; k < n; k++) {
         const px = hx + DIRX[k] * r
         const py = hy + DIRY[k] * r
         if (dist2(px, py, z.next_center[0], z.next_center[1]) > z.next_radius - 8) continue
         const cl = this.nav.clearAt(px, py)
-        if (cl < need + 0.3 || cl > need + 3.5 || !this.nav.free(px, py)) continue
-        if (r < best) {
-          best = r
+        if (cl < need + 0.3 || cl > need + 6 || !this.nav.free(px, py)) continue
+        // how many directions can a mech 70 m away see this spot from? fewer is better
+        const gz = w.groundAt(px, py) + 5
+        let vis = 0
+        for (let q = 0; q < NDIR; q++) {
+          const ox = px + DIRX[q] * 70
+          const oy = py + DIRY[q] * 70
+          if (w.losClear(ox, oy, w.topAt(ox, oy) + 8, px, py, gz)) vis++
+        }
+        const s = vis + r / 12
+        if (s < best) {
+          best = s
           bx = px
           by = py
         }
       }
-      if (best < Infinity) break
     }
     this.idleX = bx
     this.idleY = by
@@ -454,31 +481,52 @@ export class Brain {
         targetDist = d
       }
     }
-    let fight = false
-    if (target) {
-      this.targetId = target.id
-      const hurtByMech = this.lastHurtBy >= 0 && this.lastHurtBy < 100 && t - this.lastHurtT < 4
-      fight = (targetLos && targetDist <= 175) || targetDist <= 60 || hurtByMech
+    const tk0 = target as Aimable | null
+    if (tk0) {
+      this.targetId = tk0.id
       if (targetLos) this.lastSawTargetT = t
     } else this.targetId = -1
 
-    // fight or run (with hysteresis)
+    // ---- posture. Any mech in contact puts us behind cover. From there we either trade shots
+    // (lean out when a weapon is ready) or stay hidden and repair. Hysteresis stops flapping.
     const nT = threats.length
-    let evade = this.evading
-    const tk0 = target as Aimable | null
-    const finishable = !!tk0 && tk0.hp < me.hp * 0.5
-    // a laser out-trades a gun at range: do not stand in the open against one
+    // once a mech is clearly losing, keep hitting it: if we let go it repairs and the damage is wasted
+    const finishable = !!tk0 && (tk0.hp < me.hp * 0.5 || (tk0.hp < 0.55 * tk0.maxHp && me.hp > tk0.hp * 1.3))
+    // a laser out-trades a gun at range: do not trade with one unless we hold one too
     const outgunned = !!tk0 && tk0.weapons.includes("laser") && sLaser < 0 && targetDist > 55
-    if (!evade) {
-      if (nT > 0 && hpFrac < 0.4 && !finishable) evade = true
-      if (nT >= 3) evade = true
-      if (nT === 2 && hpFrac < 0.65) evade = true
-      if (unseenShooter && underFire && !tk0) evade = true
-      if (outgunned && hpFrac < 0.8 && !finishable) evade = true
-    } else if ((nT === 0 && (hpFrac > 0.75 || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > 0.85 && !unseenShooter && !outgunned) || (finishable && nT === 1)) evade = false
-    if (king) evade = false
-    this.evading = evade
-    if (evade) fight = false
+    const ambush = this.ambushStance()
+    const hurtByMech = this.lastHurtBy >= 0 && this.lastHurtBy < 100 && t - this.lastHurtT < 4
+    let hide = this.evading
+    let fight: boolean
+    if (ambush) {
+      // free-for-all: placement is what counts and the others thin each other out. Stay out of
+      // sight, and only trade shots with a mech that is close, is shooting us, or is nearly dead.
+      if (!hide) {
+        if (nT > 0 && hpFrac < (nT >= 2 ? 0.7 : 0.45) && !finishable) hide = true
+        if (nT >= 3) hide = true
+        if (unseenShooter && underFire && !tk0) hide = true
+        if (outgunned && hpFrac < 0.85 && !finishable) hide = true
+      } else if (nT === 0) {
+        if (hpFrac > 0.85 || t - this.lastThreatT > 10) hide = false
+      } else if (nT === 1 && ((hpFrac > 0.85 && !unseenShooter && !outgunned) || finishable)) hide = false
+      fight = nT > 0 && !hide && !!tk0 && (targetDist <= 120 || hurtByMech || finishable)
+    } else {
+      // practice squad: they never fight each other, so a house bot only dies if we kill it.
+      // Take the fight while healthy, break off when losing.
+      if (!hide) {
+        if (nT > 0 && hpFrac < 0.4 && !finishable) hide = true
+        if (nT >= 3) hide = true
+        if (nT === 2 && hpFrac < 0.65) hide = true
+        if (unseenShooter && underFire && !tk0) hide = true
+        if (outgunned && hpFrac < 0.8 && !finishable) hide = true
+      } else if ((nT === 0 && (hpFrac > 0.75 || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > 0.85 && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
+      fight = !hide && !!tk0 && ((targetLos && targetDist <= 175) || targetDist <= 60 || hurtByMech)
+    }
+    if (king) hide = false
+    this.evading = hide
+    if (hide) fight = false
+    // in a free-for-all, a mech we are not fighting is one to stay hidden from
+    const evade = hide || (ambush && nT > 0 && !fight && !king)
 
     // nothing hostile in the way: shoot drones that shoot us, then crates, then drones for cubes
     if (!target) {
@@ -494,7 +542,8 @@ export class Brain {
           targetDist = d
         }
       }
-      const calm = nT === 0 && !underFire && me.cubes < 14 && me.in_zone
+      // shooting anything restarts the repair timer, so only farm at full health and with nobody about
+      const calm = nT === 0 && !underFire && !hide && hpFrac >= 0.9 && t - this.lastThreatT > 6 && me.cubes < 14 && me.in_zone
       for (const k of this.tracks.values()) {
         if (k.kind !== "npc" || k.seen < t - 0.01) continue
         const angry = k.id === this.lastHurtBy && t - this.lastHurtT < 6
@@ -509,28 +558,37 @@ export class Brain {
 
     // peek logic: want a line of fire when a weapon is ready, want to be hidden when none is
     let wantLos = 0
-    if (fight && target) {
-      let ready = false
-      const gun = sGun >= 0 ? me.weapons[sGun] : null
-      const laser = sLaser >= 0 ? me.weapons[sLaser] : null
-      const light = sLight >= 0 ? me.weapons[sLight] : null
-      if (gun && (gun.ammo ?? 1) > 0 && (gun.reload ?? 0) <= 0.25) ready = true
-      let laserHot = false
-      if (laser && (laser.charge ?? 0) >= (laser.stats.charge ?? 0.75) - 0.3) {
-        ready = true
-        laserHot = true
+    if (nT > 0 && tk0 && (ambush || fight)) {
+      if (!fight) wantLos = -1.6
+      else {
+        let ready = false
+        const gun = sGun >= 0 ? me.weapons[sGun] : null
+        const laser = sLaser >= 0 ? me.weapons[sLaser] : null
+        const light = sLight >= 0 ? me.weapons[sLight] : null
+        // how far each ready weapon can usefully reach: beyond that, wait behind cover
+        if (gun && (gun.ammo ?? 1) > 0 && (gun.reload ?? 0) <= 0.25 && (!ambush || targetDist <= Math.min((gun.stats.range ?? 230) - 10, (gun.stats.speed ?? 252) * 0.8))) ready = true
+        let laserHot = false
+        if (laser && (laser.charge ?? 0) >= (laser.stats.charge ?? 0.75) - 0.3 && targetDist <= (laser.stats.range ?? 280) - 5) {
+          ready = true
+          laserHot = true
+        }
+        if (light && targetDist <= (light.stats.range ?? 45) + 6 && me.energy >= (light.stats.energy ?? 3) * 3) ready = true
+        let duck = false
+        for (const k of threats) {
+          if (!k.charging || k.seen < t - 0.3) continue
+          const toMe = Math.atan2(y - k.y, x - k.x)
+          if (Math.abs(wrap(toMe - k.yaw)) < 0.3 && dist2(x, y, k.x, k.y) < 300) duck = true
+        }
+        wantLos = duck && !laserHot ? -1.6 : ready ? 1 : -1
       }
-      if (light && targetDist <= (light.stats.range ?? 45) + 6 && me.energy >= (light.stats.energy ?? 3) * 3) ready = true
-      let hide = false
-      for (const k of threats) {
-        if (!k.charging || k.seen < t - 0.3) continue
-        const toMe = Math.atan2(y - k.y, x - k.x)
-        if (Math.abs(wrap(toMe - k.yaw)) < 0.3 && dist2(x, y, k.x, k.y) < 300) hide = true
-      }
-      wantLos = hide && !laserHot ? -1.6 : ready ? 1 : -1
     }
 
-    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
+    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
+  }
+
+  /** hide-first posture? Forced by MECH_STANCE=ambush|brawl, otherwise on once the match looks like a free-for-all. */
+  private ambushStance(): boolean {
+    return STANCE === "ambush" ? true : STANCE === "brawl" ? false : this.ffa
   }
 
   // ------------------------------------------------------------------------------------------ goal
@@ -539,6 +597,22 @@ export class Brain {
     const zn = obs.zone
     const { x, y, t } = c
     const stay: Goal = { x, y, arrive: 1e9, why: "hold", boost: false, travel: false }
+    const live = c.zone
+    const late = t > zn.shrink_start - 20
+    const okSpot = (px: number, py: number) => (late ? dist2(px, py, zn.next_center[0], zn.next_center[1]) < zn.next_radius - 4 : dist2(px, py, live.cx, live.cy) < live.r - 6)
+    const skip = (id: number) => (this.ignore.get(id) ?? -1) > t
+    // give up on something we are not getting closer to (on a ledge, behind a fence, in a pit)
+    const chase = (id: number, d: number, limit: number): boolean => {
+      if (id !== this.chaseId || d < this.chaseBest - 2.5) {
+        this.chaseId = id
+        this.chaseBest = d
+        this.chaseT = t
+      }
+      if (t - this.chaseT <= limit) return true
+      this.ignore.set(id, t + 30)
+      this.chaseId = -1
+      return false
+    }
 
     if (c.mustGo) {
       const [hx, hy] = this.homePoint(obs, c)
@@ -550,65 +624,117 @@ export class Brain {
       const ky = cell >= 0 && !this.nav.free(zn.next_center[0], zn.next_center[1], 0.5) ? this.nav.cellY(cell) : zn.next_center[1]
       return { x: kx, y: ky, arrive: 0.5, why: "king", boost: dist2(x, y, kx, ky) > zn.next_radius + 10, travel: true }
     }
-    if (c.evade) {
-      const [cx, cy] = this.coverSpot(obs, c)
-      return { x: cx, y: cy, arrive: 1.5, why: "evade", boost: c.exposed && me.energy > 30, travel: true }
+    // ---- power beats position. A laser is worth about a kill a match and every cube is 4% more HP
+    // and damage, so with a mech about we still go for one that is close (the torso keeps shooting).
+    if (c.threats.length > 0 && c.hpFrac > 0.35) {
+      // not something an enemy is standing nearer to than we are
+      const contested = (px: number, py: number, d: number) => c.threats.some((k) => dist2(px, py, k.x, k.y) + 10 < d)
+      let gc: Item | null = null
+      let gd = c.ambush ? 25 : 45
+      for (const it of this.cubes.values()) {
+        if (it.roof || skip(it.id) || !okSpot(it.x, it.y)) continue
+        const d = dist2(x, y, it.x, it.y)
+        if (d < gd && !contested(it.x, it.y, d)) {
+          gd = d
+          gc = it
+        }
+      }
+      if (gc && chase(gc.id, gd, 6)) return { x: gc.x, y: gc.y, arrive: 0.8, why: "grab-cube", boost: false, travel: true }
+      let gw: Item | null = null
+      let gs = 0
+      for (const it of this.pickups.values()) {
+        if (it.roof || skip(it.id) || !okSpot(it.x, it.y)) continue
+        const gain = this.pickupGain(me.weapons, it.kind, live.r)
+        const d = dist2(x, y, it.x, it.y)
+        // a laser is worth a long run; anything else only if we hold nothing and it is on the way
+        const reach = (it.kind === "laser" ? 120 : gain >= 2 ? 60 : 0) * (c.ambush ? 0.6 : 1)
+        if (gain <= 0 || d > reach || contested(it.x, it.y, d)) continue
+        const s = gain / (d + 25)
+        if (s > gs) {
+          gs = s
+          gw = it
+        }
+      }
+      if (gw && chase(gw.id, dist2(x, y, gw.x, gw.y), 9)) return { x: gw.x, y: gw.y, arrive: 1.2, why: `grab-${gw.kind}`, boost: c.exposed && me.energy > 50, travel: true }
     }
-    if (c.fight && c.target) {
-      const k = c.target
-      const d = dist2(x, y, k.x, k.y)
-      let rmin = 45
-      let rmax = 85
-      if (c.sLaser >= 0) {
-        rmin = 70
-        rmax = 140
-      } else if (c.sLight >= 0 && me.energy > 25) {
-        rmin = 12
-        rmax = 36
-      } else if (k.weapons.includes("laser")) {
-        rmin = 30
-        rmax = 60
+
+    if (!c.ambush) {
+      // ---- practice posture: break off when losing, otherwise hold a range that suits our weapons
+      if (c.evade) {
+        const [cx, cy] = this.coverSpot(obs, c, false)
+        return { x: cx, y: cy, arrive: 1.5, why: "evade", boost: c.exposed && me.energy > 30, travel: true }
       }
-      if (k.weapons.includes("lightning") && c.sLight < 0) rmin = Math.max(rmin, 60)
-      if (k.hp < 0.3 * k.maxHp && c.hpFrac > 0.5) rmax = Math.min(rmax, 45)
-      rmax = Math.max(rmax, rmin + 15)
-      const lost = t - this.lastSawTargetT > 4
-      const inZone = dist2(k.x, k.y, zn.next_center[0], zn.next_center[1]) < zn.next_radius + 20 || t < zn.shrink_start - 25
-      if (d > rmax + 4 && !lost && inZone) return { x: k.x, y: k.y, arrive: rmax, why: "fight-close", boost: false, travel: true }
-      if (d < rmin - 4 && d > 0.5) {
-        const bx = x + ((x - k.x) / d) * 18
-        const by = y + ((y - k.y) / d) * 18
-        if (this.nav.free(bx, by) && dist2(bx, by, c.zone.cx, c.zone.cy) < c.zone.r - 6) return { x: bx, y: by, arrive: 2, why: "fight-back", boost: false, travel: false }
+      if (c.fight && c.target) {
+        const k = c.target
+        const d = dist2(x, y, k.x, k.y)
+        let rmin = 45
+        let rmax = 85
+        if (c.sLaser >= 0) {
+          rmin = 70
+          rmax = 140
+        } else if (c.sLight >= 0 && me.energy > 25) {
+          rmin = 12
+          rmax = 36
+        } else if (k.weapons.includes("laser")) {
+          rmin = 30
+          rmax = 60
+        }
+        if (k.weapons.includes("lightning") && c.sLight < 0) rmin = Math.max(rmin, 60)
+        if (k.hp < 0.3 * k.maxHp && c.hpFrac > 0.5) rmax = Math.min(rmax, 45)
+        rmax = Math.max(rmax, rmin + 15)
+        const lost = t - this.lastSawTargetT > 4
+        const inZone = dist2(k.x, k.y, zn.next_center[0], zn.next_center[1]) < zn.next_radius + 20 || t < zn.shrink_start - 25
+        if (d > rmax + 4 && !lost && inZone) return { x: k.x, y: k.y, arrive: rmax, why: "fight-close", boost: false, travel: true }
+        if (d < rmin - 4 && d > 0.5) {
+          const bx = x + ((x - k.x) / d) * 18
+          const by = y + ((y - k.y) / d) * 18
+          if (this.nav.free(bx, by) && dist2(bx, by, c.zone.cx, c.zone.cy) < c.zone.r - 6) return { x: bx, y: by, arrive: 2, why: "fight-back", boost: false, travel: false }
+        }
+        return { ...stay, why: "fight" }
       }
-      return { ...stay, why: "fight" }
+    }
+    // ---- free-for-all posture: get behind cover and deal with a mech from there. We never walk
+    // at an enemy across open ground; it has to come to us, and shows itself when it does.
+    if (c.ambush && (c.evade || c.fight) && c.threats.length > 0) {
+      const k = c.fight ? c.target : null
+      if (k && k.kind === "mech" && k.hp < 0.25 * k.maxHp && c.hpFrac > 0.5 && c.threats.length === 1 && c.targetDist < 130) {
+        // one shot from dead and alone: go and finish it
+        return { x: k.x, y: k.y, arrive: 25, why: "finish", boost: me.energy > 40, travel: true }
+      }
+      const [cx, cy] = this.coverSpot(obs, c, c.fight)
+      const far = dist2(x, y, cx, cy) > 10
+      return { x: cx, y: cy, arrive: 1.5, why: c.fight ? "ambush" : "hide", boost: c.exposed && far && me.energy > (c.fight ? 45 : 25), travel: true }
+    }
+    // just lost contact: stay put behind the same cover for a few seconds before wandering off
+    if (t - this.lastThreatT < 6 && Number.isFinite(this.coverX) && t - this.coverT < 12 && dist2(x, y, this.coverX, this.coverY) < 40) {
+      return { x: this.coverX, y: this.coverY, arrive: 2, why: "wary", boost: false, travel: false }
     }
 
     // ---- nobody to deal with: improve
-    const live = c.zone
-    const late = t > zn.shrink_start - 20
-    const okSpot = (px: number, py: number) => (late ? dist2(px, py, zn.next_center[0], zn.next_center[1]) < zn.next_radius - 4 : dist2(px, py, live.cx, live.cy) < live.r - 6)
     const quiet = c.threats.length === 0
 
     // supply drop: 3 cubes and a full repair
     for (const d of obs.drops) {
+      if (skip(d.id)) continue
       const dd = dist2(x, y, d.pos[0], d.pos[1])
       if (dd > 280 || d.lands_in > dd / c.walk + 16) continue
       if (!okSpot(d.pos[0], d.pos[1]) && d.lands_in > 0) continue
       if (!quiet && c.hpFrac < 0.5) continue
+      if (dd > 6 && !chase(d.id, dd, 14)) continue
       return { x: d.pos[0], y: d.pos[1], arrive: 1.5, why: "drop", boost: false, travel: true }
     }
     // cubes lying around
     let best: Item | null = null
     let bd = 90
     for (const it of this.cubes.values()) {
-      if (it.roof || !okSpot(it.x, it.y)) continue
+      if (it.roof || !okSpot(it.x, it.y) || skip(it.id)) continue
       const d = dist2(x, y, it.x, it.y)
       if (d < bd) {
         bd = d
         best = it
       }
     }
-    if (best) return { x: best.x, y: best.y, arrive: 0.8, why: "cube", boost: false, travel: true }
+    if (best && chase(best.id, bd, 7)) return { x: best.x, y: best.y, arrive: 0.8, why: "cube", boost: false, travel: true }
 
     // a better weapon
     let bw: Item | null = null
@@ -618,21 +744,21 @@ export class Brain {
       const gain = this.pickupGain(me.weapons, it.kind, live.r)
       if (gain <= 0) continue
       const d = dist2(x, y, it.x, it.y)
-      if (d > (me.weapons[1] && me.weapons[0] ? 150 : 320)) continue
+      if (d > (it.kind === "laser" || !(me.weapons[1] && me.weapons[0]) ? 320 : 150)) continue
       const s = gain / (d + 25)
       if (s > bs) {
         bs = s
         bw = it
       }
     }
-    if (bw) return { x: bw.x, y: bw.y, arrive: 1.2, why: `get-${bw.kind}`, boost: false, travel: true }
+    if (bw && chase(bw.id, dist2(x, y, bw.x, bw.y), 9)) return { x: bw.x, y: bw.y, arrive: 1.2, why: `get-${bw.kind}`, boost: false, travel: true }
 
-    // crates: a cube each and maybe a weapon
-    if (quiet && me.cubes < 14) {
+    // crates: a cube each and maybe a weapon (only at full health: shooting stops our repair)
+    if (quiet && me.cubes < 14 && c.hpFrac >= 0.9 && !c.evade) {
       let bc: Item | null = null
       let bcd = 200
       for (const it of this.crates.values()) {
-        if (it.roof || !okSpot(it.x, it.y)) continue
+        if (it.roof || !okSpot(it.x, it.y) || skip(it.id)) continue
         const d = dist2(x, y, it.x, it.y)
         if (d < bcd) {
           bcd = d
@@ -641,7 +767,8 @@ export class Brain {
       }
       if (bc) {
         if (c.target && c.target.id === bc.id) return { ...stay, why: "crate" }
-        return { x: bc.x, y: bc.y, arrive: 35, why: "to-crate", boost: false, travel: true }
+        // walk up until we have a clear shot at it
+        if (chase(bc.id, bcd, 10)) return { x: bc.x, y: bc.y, arrive: 6, why: "to-crate", boost: false, travel: true }
       }
     }
     if (c.target) return { ...stay, why: "farm" }
@@ -662,11 +789,14 @@ export class Brain {
     return worst === Infinity ? 0 : val(kind) - worst - 0.5
   }
 
-  /** best nearby spot hidden from everyone hunting us */
-  private coverSpot(obs: Observation, c: Ctx): [number, number] {
+  /**
+   * Best nearby spot hidden from everyone hunting us. With `peek`, prefer a corner: hidden where we
+   * stand, with a line of fire to the target a few steps to the side.
+   */
+  private coverSpot(obs: Observation, c: Ctx, peek: boolean): [number, number] {
     const { x, y, t } = c
     const w = this.world
-    const hiddenFrom = (px: number, py: number): number => {
+    const seenBy = (px: number, py: number): number => {
       const gz = w.groundAt(px, py)
       let seen = 0
       for (const k of c.threats) {
@@ -675,35 +805,59 @@ export class Brain {
       }
       return seen
     }
-    if (Number.isFinite(this.coverX) && t - this.coverT < 1.2 && hiddenFrom(this.coverX, this.coverY) === 0) return [this.coverX, this.coverY]
+    const have = Number.isFinite(this.coverX)
+    // keep the spot we chose while it still hides us; look again at most a few times a second
+    if (have && t - this.coverT < 0.3) return [this.coverX, this.coverY]
+    if (have && t - this.coverT < 1.5 && this.coverPeek === peek && seenBy(this.coverX, this.coverY) === 0) return [this.coverX, this.coverY]
     const zn = obs.zone
     const soon = this.zoneAt(obs, t + 6)
+    const tk = peek && c.target && c.target.kind === "mech" ? c.target : null
+    // as the shrink nears, cover outside the next circle is a trap: the zone will flush us out
+    const lead = zn.shrink_start - t
+    const outPen = lead > 40 ? 0.5 : lead > 0 ? 0.5 + ((40 - lead) / 40) * 3.5 : 6
     let best = -1e9
     let bx = x
     let by = y
-    const rings = [0, 8, 16, 26, 38, 52, 70]
-    for (const r of rings) {
-      const n = r === 0 ? 1 : NDIR
-      for (let k = 0; k < n; k++) {
-        const px = x + DIRX[k] * r
-        const py = y + DIRY[k] * r
-        if (!this.nav.free(px, py)) continue
-        if (dist2(px, py, soon.cx, soon.cy) > soon.r - 5) continue
-        let s = -3 * hiddenFrom(px, py) - r / 35
-        let near = Infinity
-        for (const th of c.threats) near = Math.min(near, dist2(px, py, th.x, th.y))
-        if (near < Infinity) s += Math.min(near, 150) / 60
-        if (dist2(px, py, zn.next_center[0], zn.next_center[1]) > zn.next_radius - 5) s -= 1
-        if (s > best) {
-          best = s
-          bx = px
-          by = py
+    let bestSeen = 99
+    const consider = (px: number, py: number, r: number, bonus: number) => {
+      if (!this.nav.free(px, py)) return
+      if (dist2(px, py, soon.cx, soon.cy) > soon.r - 5) return
+      const seen = seenBy(px, py)
+      let s = -3 * seen - r / 35 + bonus
+      let near = Infinity
+      for (const th of c.threats) near = Math.min(near, dist2(px, py, th.x, th.y))
+      if (near < Infinity) s += Math.min(near, 150) / 75
+      if (dist2(px, py, zn.next_center[0], zn.next_center[1]) > zn.next_radius - 5) s -= outPen
+      if (tk && seen === 0) {
+        const tz = tk.z + tk.h * 0.5
+        for (let k = 0; k < NDIR; k += 2) {
+          const qx = px + DIRX[k] * 7
+          const qy = py + DIRY[k] * 7
+          if (this.nav.free(qx, qy) && w.losClear(qx, qy, w.groundAt(qx, qy) + c.mh, tk.x, tk.y, tz)) {
+            s += 1.2
+            break
+          }
         }
       }
+      if (s > best) {
+        best = s
+        bx = px
+        by = py
+        bestSeen = seen
+      }
     }
+    if (have) consider(this.coverX, this.coverY, dist2(x, y, this.coverX, this.coverY), 0.8)
+    const ring = (r: number) => {
+      const n = r === 0 ? 1 : NDIR
+      for (let k = 0; k < n; k++) consider(x + DIRX[k] * r, y + DIRY[k] * r, r, 0)
+    }
+    for (const r of [0, 6, 12, 20, 30, 42, 56, 72]) ring(r)
+    // nothing close hides us: look further before settling for the least bad spot
+    if (bestSeen > 0) for (const r of [95, 125]) ring(r)
     this.coverX = bx
     this.coverY = by
     this.coverT = t
+    this.coverPeek = peek
     return [bx, by]
   }
 
@@ -846,7 +1000,15 @@ export class Brain {
     }
 
     // ---- strafe direction against the current target
-    const tk = c.fight ? c.target : null
+    // the zone outranks cover: outside it we cannot repair and it only gets worse
+    const forced = goal.why === "zone" || goal.why === "king"
+    const grabbing = goal.why.startsWith("grab")
+    const goalW = forced ? 4 : grabbing ? 2.5 : 1
+    const coverW = forced ? 0.3 : grabbing ? 0.5 : 1
+    const mechTarget = c.target && c.target.kind === "mech" ? c.target : null
+    const tk = c.ambush ? (c.fight || c.evade ? mechTarget : null) : c.fight ? mechTarget : null
+    // hide-first: side-step only while it can actually see us, and stand still behind cover
+    const jink = !tk ? 0 : c.ambush ? (c.targetLos ? (c.fight ? 0.7 : 0.4) : 0) : c.targetLos ? 0.7 : 0.2
     let sx = 0
     let sy = 0
     if (tk) {
@@ -881,7 +1043,7 @@ export class Brain {
       const sp = moving ? speed : 0
       const [p1x, p1y] = pred(dx, dy, sp, 0.45)
       const [p2x, p2y] = pred(dx, dy, sp, 1.0)
-      let s = dx * gdx + dy * gdy
+      let s = (dx * gdx + dy * gdy) * goalW
       if (onGround && moving && !this.nav.segOk(x, y, p1x, p1y, 0.5)) {
         // walking into a wall; allowed only if it gets us out of a tight spot
         if (!(curClear < this.nav.need && this.nav.clearAt(p1x, p1y) > curClear)) s -= 6
@@ -903,16 +1065,16 @@ export class Brain {
       if (c.king) s -= dist2(p1x, p1y, zn.next_center[0], zn.next_center[1]) * 0.8
       else if (insideNow && dist2(p2x, p2y, zSoon.cx, zSoon.cy) > zSoon.r - 2) s -= 2.5
       if (tk) {
-        s += (c.targetLos ? 0.7 : 0.2) * (dx * sx + dy * sy)
+        s += jink * (dx * sx + dy * sy)
         if (c.wantLos !== 0) {
           const tz = tk.z + tk.h * 0.5
           const l1 = w.losClear(p1x, p1y, w.groundAt(p1x, p1y) + c.mh, tk.x, tk.y, tz)
           const l2 = w.losClear(p2x, p2y, w.groundAt(p2x, p2y) + c.mh, tk.x, tk.y, tz)
-          s += c.wantLos * ((l1 ? 1.3 : -1.3) + (l2 ? 0.6 : -0.6))
+          s += coverW * c.wantLos * ((l1 ? 1.3 : -1.3) + (l2 ? 0.6 : -0.6))
         }
       }
       if (c.evade || c.threats.length > 1) {
-        const wgt = c.evade ? 1.2 : 0.45
+        const wgt = (c.evade ? 1.2 : 0.45) * coverW
         const g1 = w.groundAt(p1x, p1y) + c.height * 0.5
         let n = 0
         for (const k of c.threats) {
@@ -962,7 +1124,10 @@ export class Brain {
     // while hiding to repair, do not shoot unless we are being hit anyway or the kill is there:
     // dealing damage restarts the 5 s regeneration timer just like taking it
     const mechT = !!T && T.kind === "mech"
-    const holdFire = mechT && c.evade && c.hpFrac < 0.8 && t - this.lastHurtT > 1 && T!.hp > 0.25 * T!.maxHp
+    const repairing = mechT && c.evade && c.hpFrac < 0.85 && t - this.lastHurtT > 1 && T!.hp > 0.25 * T!.maxHp && c.targetDist > 45
+    // free-for-all: do not pick a fight with a distant mech that is leaving us alone
+    const unprovoked = mechT && c.ambush && !c.fight && t - this.lastMechHurtT > 3 && T!.hp > 0.35 * T!.maxHp
+    const holdFire = repairing || unprovoked
     // a charging laser halves our speed: when running from several mechs keep the legs free
     const mayCharge = !c.evade || c.threats.length <= 1
 
@@ -1011,7 +1176,9 @@ export class Brain {
           const full = st.charge ?? 0.75
           const ch = wp.charge ?? 0
           const inRange = dist <= (st.range ?? 280) - 3
-          const recently = t - this.lastSawTargetT < 1.5
+          // charge ahead of time when it was just in view, or is walking up to our corner
+          const closing = dist > 1 ? -(dx * T.vx + dy * T.vy) / dist : 0
+          const recently = t - this.lastSawTargetT < 1.5 || (dist < 70 && closing > 2)
           let hold = false
           if (inRange && (ch > 0 || (wp.cooldown <= 0.05 && mayCharge && !holdFire)) && (los || recently || ch > 0)) hold = true
           if (ch > 0) {
