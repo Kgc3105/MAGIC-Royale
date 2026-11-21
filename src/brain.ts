@@ -610,9 +610,9 @@ export class Brain {
         frac = 0.86
       }
       if (los) exposed = true
-      let s = -d / 60 - (k.hp / Math.max(1, k.maxHp)) * 1.5 + (los ? 2.5 : 0)
-      if (k.id === this.targetId) s += 0.6
-      if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) s += 1
+      let s = -d / tv("tsD", 60) - (k.hp / Math.max(1, k.maxHp)) * tv("tsHp", 1.5) + (los ? tv("tsLos", 2.5) : 0)
+      if (k.id === this.targetId) s += tv("tsStick", 0.6)
+      if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) s += tv("tsAtk", 1)
       const away = Math.abs(wrap(Math.atan2(y - k.y, x - k.x) - k.yaw)) > 1.3
       if (away && tv("tp", 0) > 0) s += 1.2 + (1 - k.hp / Math.max(1, k.maxHp))
       if (s > bestScore) {
@@ -660,12 +660,12 @@ export class Brain {
       // Take the fight while healthy, break off when losing.
       if (!hide) {
         if (nT > 0 && hpFrac < tv("evHp", 0.4) && !finishable) hide = true
-        if (nT >= tv("evN", 3)) hide = true
+        if (nT >= tv("evN", 4)) hide = true
         if (nT === 2 && hpFrac < tv("evHp2", 0.65)) hide = true
         if (unseenShooter && underFire && !tk0) hide = true
-        if (outgunned && hpFrac < 0.8 && !finishable) hide = true
-      } else if ((nT === 0 && (hpFrac > 0.75 || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > 0.85 && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
-      fight = !hide && !!tk0 && (camp || (targetLos && targetDist <= 175) || targetDist <= 60 || hurtByMech)
+        if (outgunned && hpFrac < tv("ogHp", 0.8) && !finishable) hide = true
+      } else if ((nT === 0 && (hpFrac > tv("exHp0", 0.75) || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > tv("exHp1", 0.85) && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
+      fight = !hide && !!tk0 && (camp || (targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
     }
     if (king) hide = false
     const power = this.updatePower(obs, hpFrac, ambush, king)
@@ -705,16 +705,16 @@ export class Brain {
       for (const k of threats) nearMech = Math.min(nearMech, dist2(x, y, k.x, k.y))
       const calm = power
         ? me.in_zone && nearMech > 60
-        : nT === 0 && !underFire && !hide && hpFrac >= 0.9 && t - this.lastThreatT > 6 && me.cubes < 14 && me.in_zone
+        : nT === 0 && !underFire && !hide && hpFrac >= tv("farmHp", 0.9) && t - this.lastThreatT > tv("farmWait", 6) && me.cubes < 14 && me.in_zone
       for (const k of this.tracks.values()) {
         if (k.kind !== "npc" || k.seen < t - 0.01) continue
         const angry = k.id === this.lastHurtBy && t - this.lastHurtT < 6
         if (angry) consider({ ...k, kind: "npc" }, 200, 1000)
-        else if (calm && hpFrac > 0.6) consider({ ...k, kind: "npc" }, 110, 0)
+        else if (calm && hpFrac > 0.6) consider({ ...k, kind: "npc" }, tv("npcR", 110), 0)
       }
       if (calm) {
         const cr = this.cfg.crates
-        for (const it of obs.crates) consider({ id: it.id, kind: "crate", x: it.pos[0], y: it.pos[1], z: it.pos[2], vx: 0, vy: 0, vz: 0, r: cr.radius ?? 1.4, h: cr.height ?? 2.4, hp: it.hp ?? 300, maxHp: cr.hp ?? 300, weapons: [] }, 150, 60)
+        for (const it of obs.crates) consider({ id: it.id, kind: "crate", x: it.pos[0], y: it.pos[1], z: it.pos[2], vx: 0, vy: 0, vz: 0, r: cr.radius ?? 1.4, h: cr.height ?? 2.4, hp: it.hp ?? 300, maxHp: cr.hp ?? 300, weapons: [] }, tv("crateR", 150), 60)
       }
     }
 
@@ -741,7 +741,7 @@ export class Brain {
           const toMe = Math.atan2(y - k.y, x - k.x)
           if (Math.abs(wrap(toMe - k.yaw)) < 0.3 && dist2(x, y, k.x, k.y) < 300) duck = true
         }
-        wantLos = duck && !laserHot ? -1.6 : ready ? 1 : -1
+        wantLos = duck && !laserHot ? -1.6 : ready ? 1 : -tv("hideW", 1)
       }
     }
 
@@ -997,7 +997,7 @@ export class Brain {
         const gain = this.pickupGain(me.weapons, it.kind, live.r)
         const d = dist2(x, y, it.x, it.y)
         // a laser is worth a long run; anything else only if we hold nothing and it is on the way
-        const reach = (it.kind === "laser" ? 120 : gain >= 2 ? 60 : 0) * (c.ambush ? 0.6 : 1)
+        const reach = (it.kind === "laser" ? tv("grabLaser", 120) : gain >= 2 ? 60 : 0) * (c.ambush ? 0.6 : 1)
         if (gain <= 0 || d > reach || contested(it.x, it.y, d)) continue
         const s = gain / (d + 25)
         if (s > gs) {
@@ -1074,7 +1074,7 @@ export class Brain {
     }
     // cubes lying around
     let best: Item | null = null
-    let bd = 90
+    let bd = tv("cubeR", 90)
     for (const it of this.cubes.values()) {
       if (it.roof || !okSpot(it.x, it.y) || skip(it.id)) continue
       const d = dist2(x, y, it.x, it.y)
@@ -1385,7 +1385,7 @@ export class Brain {
     const mechTarget = c.target && c.target.kind === "mech" ? c.target : null
     const tk = c.cover ? (c.fight || c.evade ? mechTarget : null) : c.fight ? mechTarget : null
     // hide-first: side-step only while it can actually see us, and stand still behind cover
-    const jink = !tk ? 0 : c.cover ? (c.targetLos ? (c.fight ? 0.7 : 0.4) : 0) : c.targetLos ? 0.7 : 0.2
+    const jink = !tk ? 0 : c.cover ? (c.targetLos ? (c.fight ? 0.7 : 0.4) : 0) : c.targetLos ? tv("jinkLos", 0.7) : tv("jinkNo", 0.2)
     let sx = 0
     let sy = 0
     if (tk) {
@@ -1418,7 +1418,7 @@ export class Brain {
     }
     const evalDir = (dx: number, dy: number, moving: boolean) => {
       const sp = moving ? speed : 0
-      const [p1x, p1y] = pred(dx, dy, sp, 0.45)
+      const [p1x, p1y] = pred(dx, dy, sp, tv("h1", 0.45))
       const [p2x, p2y] = pred(dx, dy, sp, 1.0)
       let s = (dx * gdx + dy * gdy) * goalW
       if (onGround && moving && !this.nav.segOk(x, y, p1x, p1y, 0.5)) {
@@ -1429,13 +1429,13 @@ export class Brain {
         const [mx, my] = pred(dx, dy, sp, sh.th)
         if (sh.land) {
           const d = dist2(mx, my, sh.lx, sh.ly)
-          if (d < sh.lr) s -= 4 * sh.w * (1 - d / sh.lr)
+          if (d < sh.lr) s -= tv("dodgeW", 7) * sh.w * (1 - d / sh.lr)
         } else {
           const miss = Math.abs((mx - sh.px) * sh.uy - (my - sh.py) * sh.ux)
-          const safe = c.radius + 2
+          const safe = c.radius + tv("dodgeR", 2)
           if (miss < safe) {
             const q = 1 - miss / safe
-            s -= 4 * sh.w * q * q
+            s -= tv("dodgeW", 7) * sh.w * q * q
           }
         }
       }
@@ -1447,7 +1447,7 @@ export class Brain {
           const tz = tk.z + tk.h * 0.5
           const l1 = w.losClear(p1x, p1y, w.groundAt(p1x, p1y) + c.mh, tk.x, tk.y, tz)
           const l2 = w.losClear(p2x, p2y, w.groundAt(p2x, p2y) + c.mh, tk.x, tk.y, tz)
-          s += coverW * c.wantLos * ((l1 ? 1.3 : -1.3) + (l2 ? 0.6 : -0.6))
+          s += coverW * c.wantLos * ((l1 ? 1 : -1) * tv("losW1", 1.3) + (l2 ? 0.6 : -0.6))
         }
       }
       if (c.evade || c.power || c.threats.length > 1) {
@@ -1460,7 +1460,7 @@ export class Brain {
           if (w.losClear(k.x, k.y, k.z + k.h * 0.89, p1x, p1y, g1)) s -= wgt
         }
       }
-      s += 0.15 * (dx * this.lastDX + dy * this.lastDY)
+      s += tv("smooth", 0.15) * (dx * this.lastDX + dy * this.lastDY)
       if (s > best) {
         best = s
         bx = moving ? dx : 0
@@ -1510,7 +1510,7 @@ export class Brain {
     const holdFire = repairing || unprovoked || pacing
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
-    const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > 0.3)
+    const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > tv("runChargeHp", 0.15))
 
     if (T) {
       const frac = T.aimFrac ?? 0.5
@@ -1521,7 +1521,7 @@ export class Brain {
       const dist = Math.hypot(dx, dy, dz)
       const dYaw = Math.atan2(dy, dx)
       const dPitch = Math.atan2(dz, Math.hypot(dx, dy))
-      const tolYaw = Math.atan2(T.r * 0.6, dist) + 0.002
+      const tolYaw = Math.atan2(T.r * tv("tolYaw", 0.6), dist) + 0.002
       // room above and below the aim point on its body (little above when we aim at the shoulders)
       const tolPitch = Math.atan2(T.h * 0.8 * Math.min(frac, 1 - frac), dist) + 0.002
       const errYaw = Math.abs(wrap(dYaw - me.aim[0]))
@@ -1538,7 +1538,7 @@ export class Brain {
         if (!wp) continue
         const st = wp.stats
         if (wp.kind === "gun") {
-          const [lx0, ly0, lz0] = ext(0.075)
+          const [lx0, ly0, lz0] = ext(tv("lat", 0.075))
           const tl = interceptTime(lx0, ly0, lz0, T.vx, T.vy, T.vz, st.speed ?? 252)
           if (tl <= 0) continue
           const lx = lx0 + T.vx * tl
@@ -1548,9 +1548,9 @@ export class Brain {
           const gp = Math.atan2(lz, Math.hypot(lx, ly))
           const ready = (wp.ammo ?? 1) > 0 && (wp.reload ?? 0) <= 0
           const inRange = (st.speed ?? 252) * tl <= (st.range ?? 230) - 4
-          const worth = T.kind !== "mech" || tl <= 0.8 || Math.hypot(T.vx, T.vy) < 3
+          const worth = T.kind !== "mech" || tl <= tv("gunT", 0.8) || Math.hypot(T.vx, T.vy) < 3
           let onAim = Math.abs(wrap(gy - me.aim[0])) <= tolYaw && Math.abs(gp - me.aim[1]) <= tolPitch
-          if (!onAim && tv("predAim", 0) > 0) {
+          if (!onAim && tv("predAim", 1) > 0) {
             const turn = (S.turn_rate ?? 4) * 0.05
             const tilt = (S.pitch_rate ?? 3) * 0.05
             const ey = wrap(gy - me.aim[0])
@@ -1569,7 +1569,7 @@ export class Brain {
           const inRange = dist <= (st.range ?? 280) - 3
           // charge ahead of time when it was just in view, or is walking up to our corner
           const closing = dist > 1 ? -(dx * T.vx + dy * T.vy) / dist : 0
-          const recently = t - this.lastSawTargetT < 1.5 || (dist < 70 && closing > 2)
+          const recently = t - this.lastSawTargetT < tv("preCharge", 1.5) || (dist < 70 && closing > 2)
           let hold = false
           if (inRange && (ch > 0 || (wp.cooldown <= 0.05 && mayCharge && !holdFire)) && (los || recently || ch > 0)) hold = true
           if (ch > 0) {
@@ -1650,7 +1650,7 @@ export class Brain {
     if (gun && (gun.reload ?? 0) <= 0) {
       const ammo = gun.ammo ?? 1
       const mag = gun.stats.mag ?? 12
-      if (ammo <= 0 || (!c.target && ammo < mag * 0.7 && t - this.lastSawTargetT > 1.5) || (c.fight && !c.targetLos && ammo < mag * 0.34 && t - this.lastSawTargetT > 0.8)) out.reload = true
+      if (ammo <= 0 || (!c.target && ammo < mag * tv("relIdle", 0.7) && t - this.lastSawTargetT > 1.5) || (c.fight && !c.targetLos && ammo < mag * tv("relFight", 0.34) && t - this.lastSawTargetT > 0.8)) out.reload = true
     }
   }
 
