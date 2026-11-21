@@ -102,6 +102,16 @@ const CHARGE_ON_RUN = ((typeof process !== "undefined" && process.env?.MECH_RUNC
 const STANCE = (typeof process !== "undefined" && process.env?.MECH_STANCE) || "auto"
 /** sniper posture when holding a laser; MECH_CAMP=0/1 overrides for local testing */
 const CAMP = ((typeof process !== "undefined" && process.env?.MECH_CAMP) || CAMP_DEFAULT) === "1"
+/** alternative upgrade orders tried in sparring (tune "upg") */
+const UPGRADE_ALT: string[][] = [
+  UPGRADE_ORDER,
+  // 1: damage first
+  ["laser_damage", "gun_damage", "plating", "gun_rate", "armor", "laser_charge", "gun_mag", "nanites", "servos", "jets", "reactor", "capacitor", "gun_velocity"],
+  // 2: toughness then damage, no repair or speed early
+  ["plating", "armor", "laser_damage", "gun_damage", "gun_rate", "gun_mag", "laser_charge", "nanites", "servos", "jets", "reactor", "capacitor", "gun_velocity"],
+  // 3: toughness, damage and magazine interleaved
+  ["plating", "laser_damage", "armor", "gun_mag", "gun_damage", "gun_rate", "nanites", "laser_charge", "servos", "jets", "reactor", "capacitor", "gun_velocity"],
+]
 const NDIR = 16
 const DIRX = new Float64Array(NDIR)
 const DIRY = new Float64Array(NDIR)
@@ -1539,7 +1549,14 @@ export class Brain {
           const ready = (wp.ammo ?? 1) > 0 && (wp.reload ?? 0) <= 0
           const inRange = (st.speed ?? 252) * tl <= (st.range ?? 230) - 4
           const worth = T.kind !== "mech" || tl <= 0.8 || Math.hypot(T.vx, T.vy) < 3
-          const onAim = Math.abs(wrap(gy - me.aim[0])) <= tolYaw && Math.abs(gp - me.aim[1]) <= tolPitch
+          let onAim = Math.abs(wrap(gy - me.aim[0])) <= tolYaw && Math.abs(gp - me.aim[1]) <= tolPitch
+          if (!onAim && tv("predAim", 0) > 0) {
+            const turn = (S.turn_rate ?? 4) * 0.05
+            const tilt = (S.pitch_rate ?? 3) * 0.05
+            const ey = wrap(gy - me.aim[0])
+            const ep = gp - me.aim[1]
+            onAim = Math.abs(ey - clamp(ey, -turn, turn)) <= tolYaw && Math.abs(ep - clamp(ep, -tilt, tilt)) <= tolPitch
+          }
           if (ready && inRange && worth && los && onAim && !holdFire) fire[s] = true
           if (ready && inRange && prio < 1) {
             prio = 1
@@ -1643,7 +1660,7 @@ export class Brain {
     let best = 0
     let rank = Infinity
     for (let i = 0; i < ch.length; i++) {
-      let r = UPGRADE_ORDER.indexOf(ch[i].id)
+      let r = (UPGRADE_ALT[tv("upg", 0)] ?? UPGRADE_ORDER).indexOf(ch[i].id)
       if (r < 0) r = 50
       if (r < rank) {
         rank = r
