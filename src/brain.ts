@@ -223,7 +223,11 @@ export class Brain {
     this.cfg = hello.config
     this.world = shared?.world ?? new World(hello.map.dir, hello.map.files)
     this.nav = shared?.nav ?? new Nav(this.world)
-    this.rng = mulberry32((hello.seed ^ 0x9e3779b9) >>> 0)
+    // "salt" shifts our own random choices (when to change strafing direction). Practice matches are
+    // fixed and repeatable, so the same build always plays the same 48 fights; a different salt
+    // plays them differently without changing the strategy.
+    const salt = Math.trunc(this.tuneOv?.salt ?? TUNE.salt ?? 0)
+    this.rng = mulberry32((hello.seed ^ 0x9e3779b9 ^ Math.imul(salt, 0x85ebca6b)) >>> 0)
     if (!shared) {
       this.warmUp()
       try {
