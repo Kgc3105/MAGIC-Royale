@@ -31,6 +31,10 @@ const SKILL = args.get("skill") ?? "medium"
 const STATIC_ZONE = args.has("static-zone")
 /** hunters always know where the bot is (the first, harsher model) instead of sharing vision */
 const OMNISCIENT = args.has("omniscient")
+/** whose sight the hunters can use: "all" house bots (default), only the "hunters", or nobody ("lost": they only see us when one of them looks straight at us from close by) */
+const VISION = args.get("vision") ?? "all"
+/** how long hunters keep heading for where we were last seen before they give up and wander */
+const FORGET = Number(args.get("forget") ?? 1e9)
 const HUNT_DELAY = Number(args.get("delay") ?? 0)
 /** when every house bot joins the hunt regardless of kills (our guess at "late in the match") */
 const LATE_T = Number(args.get("late") ?? 255)
@@ -704,6 +708,7 @@ function runMatch(seed: number): Result {
       let seenNow = OMNISCIENT
       if (!seenNow) {
         for (const m of aliveOthers) {
+          if (VISION === "hunters" && !m.ai!.active) continue
           const d = Math.hypot(me.x - m.x, me.y - m.y)
           if (d > cfg.vision.range) continue
           if (d > cfg.vision.near_range && Math.abs(wrap(Math.atan2(me.y - m.y, me.x - m.x) - m.yaw)) > (cfg.vision.fov_deg * Math.PI) / 360) continue
@@ -743,7 +748,7 @@ function runMatch(seed: number): Result {
           } else if (ai.lastTgt >= 0 && t - ai.lastTgtT < 5 && mechs[ai.lastTgt].alive) tgt = mechs[ai.lastTgt]
           m.cmd = ai.decide(m, tgt, t, zinfo, true, believed)
         }
-      } else for (const m of aliveOthers) m.cmd = m.ai!.decide(m, me, t, zinfo, seen, believed)
+      } else for (const m of aliveOthers) m.cmd = m.ai!.decide(m, seen || t - knownT < FORGET ? me : null, t, zinfo, seen, believed)
 
       // ---- our bot's observation
       const eye = me.z + me.stats.eye_height

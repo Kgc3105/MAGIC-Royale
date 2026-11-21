@@ -174,6 +174,16 @@ export class Brain {
   /** last time a mech (not a drone or the zone) damaged us */
   private lastMechHurtT = -1e9
   private lastThreatT = -1e9
+  /** jet crossing out of (or into) a walled-off area: plan, and whether we are in the air on it */
+  private hopPlanT = -1e9
+  private hopPlan: { lx: number; ly: number; tx: number; ty: number; energy: number; rise: number } | null = null
+  private hopTarget = -1
+  private hopFly = false
+  private hopFlyT = 0
+  private hopFails = 0
+  private hopBan = -1e9
+  /** the rooftop laser we are going up for */
+  private roofItem: Item | null = null
   private scanStartT = 0
   private scanUntil = 1.8
   private scanYaw0 = NaN
@@ -307,6 +317,15 @@ export class Brain {
       for (let i = 0; i < 300; i++) w.losClear(ax, ay, w.groundAt(ax, ay) + 7, px(), py(), 5)
       this.nav.segOk(ax, ay, ax + 10, ay + 10)
     }
+    // also the planner for jetting out of walled-off areas, so its first real use is not a slow one
+    const nav = this.nav
+    const seen = new Set<number>([nav.mainComp])
+    for (let cc = 0; cc < nav.comp.length && seen.size < 6 && performance.now() - t0 < 1500; cc += 7) {
+      const id = nav.comp[cc]
+      if (id < 0 || seen.has(id)) continue
+      seen.add(id)
+      for (let k = 0; k < 3; k++) nav.hopPlan(nav.cellX(cc), nav.cellY(cc), nav.mainComp)
+    }
   }
 
   // ------------------------------------------------------------------------------------------ main
@@ -325,7 +344,8 @@ export class Brain {
     const c = this.assess(obs, radius, height)
     const goal = this.chooseGoal(obs, c)
     this.mode = goal.why
-    this.move(obs, c, goal, out)
+    if (this.hop(obs, c, goal, out)) this.mode = "hop"
+    else this.move(obs, c, goal, out)
     this.aimAndFire(obs, c, out)
     this.loot(obs, c, out)
     return out
@@ -879,7 +899,10 @@ export class Brain {
     const stay: Goal = { x, y, arrive: 1e9, why: "hold", boost: false, travel: false }
     const live = c.zone
     const late = t > zn.shrink_start - 20
-    const okSpot = (px: number, py: number) => (late ? dist2(px, py, zn.next_center[0], zn.next_center[1]) < zn.next_radius - 4 : dist2(px, py, live.cx, live.cy) < live.r - 6)
+    // loot in a walkable area other than the one we stand in cannot be walked to: leave it
+    const myArea = tv("hop", 1) > 0 && me.grounded ? this.nav.areaAt(x, y, 4) : -1
+    const zoneOk = (px: number, py: number) => (late ? dist2(px, py, zn.next_center[0], zn.next_center[1]) < zn.next_radius - 4 : dist2(px, py, live.cx, live.cy) < live.r - 6)
+    const okSpot = (px: number, py: number) => zoneOk(px, py) && (myArea < 0 || this.nav.areaAt(px, py, 5) === myArea)
     const skip = (id: number) => (this.ignore.get(id) ?? -1) > t
     // give up on something we are not getting closer to (on a ledge, behind a fence, in a pit)
     const chase = (id: number, d: number, limit: number): boolean => {
@@ -892,6 +915,25 @@ export class Brain {
       this.ignore.set(id, t + 30)
       this.chaseId = -1
       return false
+    }
+
+    // a laser lying on a roof, when we hold none: worth jetting up for (see hop)
+    const roofLaser = (reach: number): Goal | null => {
+      // switched off: in the simulator it rescued only a few matches and cost about as much elsewhere
+      if (tv("roof", 0) <= 0 || c.sLaser >= 0) return null
+      let bi: Item | null = null
+      let bd = reach
+      for (const it of this.pickups.values()) {
+        if (!it.roof || it.kind !== "laser" || skip(it.id) || !zoneOk(it.x, it.y)) continue
+        const d = dist2(x, y, it.x, it.y)
+        if (d < bd) {
+          bd = d
+          bi = it
+        }
+      }
+      if (!bi || !chase(bi.id, bd, 18)) return null
+      this.roofItem = bi
+      return { x: bi.x, y: bi.y, arrive: 1.2, why: "roof-laser", boost: false, travel: true }
     }
 
     if (c.mustGo) {
@@ -1006,6 +1048,10 @@ export class Brain {
         }
       }
       if (gw && chase(gw.id, dist2(x, y, gw.x, gw.y), 9)) return { x: gw.x, y: gw.y, arrive: 1.2, why: `grab-${gw.kind}`, boost: c.exposed && me.energy > 50, travel: true }
+      if (c.threats.length <= tv("roofN", 2) && c.hpFrac > tv("roofHp", 0.5)) {
+        const g = roofLaser(tv("roofR", 90))
+        if (g) return g
+      }
     }
 
     if (!c.cover) {
@@ -1099,6 +1145,10 @@ export class Brain {
         bs = s
         bw = it
       }
+    }
+    if (!bw || bw.kind !== "laser") {
+      const g = roofLaser(tv("roofRq", 160))
+      if (g) return g
     }
     if (bw && chase(bw.id, dist2(x, y, bw.x, bw.y), 9)) return { x: bw.x, y: bw.y, arrive: 1.2, why: `get-${bw.kind}`, boost: false, travel: true }
 
@@ -1294,6 +1344,122 @@ export class Brain {
     const ay = this.path[2 * aim + 1] - y
     const d = Math.hypot(ax, ay)
     return d > 1e-6 ? [ax / d, ay / d] : direct()
+  }
+
+  /**
+   * Some parts of the map (the stadium bowl, a few sunken courts and terraces) have no walking way
+   * out: the planner sees a wall all round. When where we need to be is in a different walkable
+   * area, walk to the cheapest crossing, wait for the energy, then jump and jet over.
+   * Returns true when it has set the movement for this decision.
+   */
+  private hop(obs: Observation, c: Ctx, goal: Goal, out: BotAction): boolean {
+    if (tv("hop", 1) <= 0) return false
+    const me = obs.self
+    const { x, y, z, t } = c
+    const nav = this.nav
+    const w = this.world
+    if (this.hopFly) {
+      const p = this.hopPlan
+      if (!p || t - this.hopFlyT > 14) {
+        this.hopFly = false
+        return false
+      }
+      if (me.grounded && t - this.hopFlyT > 0.5) {
+        // down again: did we make it across?
+        this.hopFly = false
+        this.hopPlanT = -1e9
+        this.replan = true
+        this.path.length = 0
+        if (this.hopTarget < -1) return false // a roof: the goal logic takes it from here
+        if (nav.areaAt(x, y, 3) === this.hopTarget) this.hopFails = 0
+        else if (++this.hopFails >= 2) {
+          this.hopBan = t + 25
+          this.hopFails = 0
+        }
+        return false
+      }
+      const dx = p.tx - x
+      const dy = p.ty - y
+      const d = Math.hypot(dx, dy)
+      const ux = d > 1e-6 ? dx / d : 0
+      const uy = d > 1e-6 ? dy / d : 0
+      // stay above whatever stands on the next stretch of the way
+      let need = w.topAt(x, y)
+      for (let s = 1; s <= Math.min(d, 30); s++) need = Math.max(need, w.topAt(x + ux * s, y + uy * s))
+      // ease off near the landing point so we do not sail past it
+      const sp = Math.min(1, (2.2 * d) / Math.max(1, c.walk))
+      out.move = d > 0.6 ? [ux * sp, uy * sp] : [0, 0]
+      out.boost = z < need + 2.5 && me.energy > 1
+      return true
+    }
+    if (goal.why === "roof-laser") {
+      const it = this.roofItem
+      if (!it || !me.grounded) return false
+      if (z - w.groundAt(x, y) > 3 && Math.abs(z - it.z) < 3) {
+        // already up there: walk straight to it
+        const d = dist2(x, y, it.x, it.y)
+        out.move = d > 0.5 ? [(it.x - x) / d, (it.y - y) / d] : [0, 0]
+        out.boost = false
+        return true
+      }
+      if (!this.hopPlan || this.hopTarget !== -2 - it.id || t - this.hopPlanT > 4) {
+        this.hopPlan = this.nav.roofPlan(x, y, it.x, it.y, it.z)
+        this.hopTarget = -2 - it.id
+        this.hopPlanT = t
+      }
+      const p = this.hopPlan
+      if (!p) {
+        this.ignore.set(it.id, t + 60)
+        return false
+      }
+      const dl = dist2(x, y, p.lx, p.ly)
+      if (dl > 2.5) {
+        this.move(obs, c, { x: p.lx, y: p.ly, arrive: 1, why: goal.why, boost: goal.boost && dl > 25, travel: true }, out)
+        return true
+      }
+      out.move = [0, 0]
+      out.boost = false
+      if (me.energy < Math.min((me.stats.energy ?? 100) - 4, p.energy + 6)) return true
+      this.hopFly = true
+      this.hopFlyT = t
+      out.jump = true
+      const d = dist2(x, y, p.tx, p.ty)
+      if (d > 1e-6) out.move = [(p.tx - x) / d, (p.ty - y) / d]
+      return true
+    }
+    if (t < this.hopBan) return false
+    if (goal.why !== "zone" && goal.why !== "king" && goal.why !== "home") return false
+    if (!me.grounded || z - w.groundAt(x, y) > 3) return false
+    const mine = nav.areaAt(x, y, 4)
+    if (mine < 0) return false
+    let target = nav.areaAt(goal.x, goal.y, 14)
+    // nothing to do in a walled-off area: do not sit in it until the zone forces the issue
+    if (goal.why === "home" && mine !== nav.mainComp) target = nav.mainComp
+    if (target < 0 || target === mine) {
+      this.hopPlan = null
+      return false
+    }
+    if (!this.hopPlan || this.hopTarget !== target || t - this.hopPlanT > 6) {
+      this.hopPlan = nav.hopPlan(x, y, target)
+      this.hopTarget = target
+      this.hopPlanT = t
+    }
+    const p = this.hopPlan
+    if (!p) return false
+    const dl = dist2(x, y, p.lx, p.ly)
+    if (dl > 2.5) {
+      this.move(obs, c, { x: p.lx, y: p.ly, arrive: 1, why: goal.why, boost: goal.boost && dl > 25, travel: true }, out)
+      return true
+    }
+    out.move = [0, 0]
+    out.boost = false
+    if (me.energy < Math.min((me.stats.energy ?? 100) - 4, p.energy + 6)) return true // wait for the jets
+    this.hopFly = true
+    this.hopFlyT = t
+    out.jump = true
+    const d = dist2(x, y, p.tx, p.ty)
+    if (d > 1e-6) out.move = [(p.tx - x) / d, (p.ty - y) / d]
+    return true
   }
 
   private move(obs: Observation, c: Ctx, goal: Goal, out: BotAction) {

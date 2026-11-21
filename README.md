@@ -40,4 +40,4 @@ Needs Node 22.18+ locally (it runs TypeScript directly). The image runs on Bun, 
 
 ## Credits
 
-The wrapper `mechfight.ts` and the Dockerfile layout come from the organisers' starter kit. A few tactics (holding fire while repairing, aiming at a target's shoulders when its centre is behind cover) were informed by reading the public MIT-licensed Astra bot; no code was copied from it.
+The wrapper `mechfight.ts` and the Dockerfile layout come from the organisers' starter kit. A few tactics (holding fire while repairing, aiming at a target's shoulders when its centre is behind cover) were informed by reading the public MIT-licensed Astra bot; no code was copied from it. The idea of recognising walled-off parts of the map and jetting out of them came from reading the public MIT-licensed giddygiddyboy bot (as packaged by Team Kanyaraasi); the implementation here is our own.

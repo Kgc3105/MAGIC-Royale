@@ -26,6 +26,13 @@ export class Nav {
   private hn = 0
   /** per nav cell: match time until which it is treated as blocked (learned from getting stuck) */
   private tmp: Float32Array
+  /** which walkable area each cell belongs to (-1: not walkable). Walls and ledges cut the areas off from each other. */
+  comp: Int32Array
+  /** the area that covers almost all of the map */
+  mainComp = 0
+  private nearCache = new Map<number, Int32Array>()
+  private bfsQ: Int32Array
+  private bfsG: Int32Array
 
   constructor(w: World) {
     this.w = w
@@ -41,6 +48,274 @@ export class Nav {
     const cap = 1 << 20
     this.hNode = new Int32Array(cap)
     this.hKey = new Float32Array(cap)
+    this.comp = new Int32Array(n).fill(-1)
+    this.bfsQ = new Int32Array(n)
+    this.bfsG = new Int32Array(n)
+    this.label()
+    // done up front so that planning a way out of a walled-off area costs next to nothing mid-match
+    this.nearTo(this.mainComp)
+  }
+
+  /** label the walkable areas (for a mech of the starting size) */
+  private label() {
+    const { gnx, gny, comp, bfsQ } = this
+    const n = gnx * gny
+    const ok = (c: number) => this.cellClear(c) >= 3.05
+    let id = 0
+    let bestSize = 0
+    for (let s = 0; s < n; s++) {
+      if (comp[s] >= 0 || !ok(s)) continue
+      let head = 0
+      let tail = 0
+      bfsQ[tail++] = s
+      comp[s] = id
+      while (head < tail) {
+        const c = bfsQ[head++]
+        const ci = c % gnx
+        const cj = (c - ci) / gnx
+        for (let dj = -1; dj <= 1; dj++) {
+          const nj = cj + dj
+          if (nj < 0 || nj >= gny) continue
+          for (let di = -1; di <= 1; di++) {
+            if (di === 0 && dj === 0) continue
+            const ni = ci + di
+            if (ni < 0 || ni >= gnx) continue
+            const nb = nj * gnx + ni
+            if (comp[nb] >= 0 || !ok(nb)) continue
+            if (di !== 0 && dj !== 0 && (!ok(cj * gnx + ni) || !ok(nj * gnx + ci))) continue
+            comp[nb] = id
+            bfsQ[tail++] = nb
+          }
+        }
+      }
+      if (tail > bestSize) {
+        bestSize = tail
+        this.mainComp = id
+      }
+      id++
+    }
+  }
+
+  /** nearest cell that belongs to a walkable area, within maxRing cells, or -1 */
+  nearComp(x: number, y: number, maxRing: number): number {
+    const c0 = this.cellOf(x, y)
+    if (this.comp[c0] >= 0) return c0
+    const ci0 = c0 % this.gnx
+    const cj0 = (c0 - ci0) / this.gnx
+    for (let r = 1; r <= maxRing; r++) {
+      let best = -1
+      let bd = Infinity
+      for (let dj = -r; dj <= r; dj++) {
+        const cj = cj0 + dj
+        if (cj < 0 || cj >= this.gny) continue
+        const edge = dj === -r || dj === r
+        for (let di = -r; di <= r; di += edge ? 1 : 2 * r) {
+          const ci = ci0 + di
+          if (ci < 0 || ci >= this.gnx) continue
+          const c = cj * this.gnx + ci
+          if (this.comp[c] < 0) continue
+          const dd = di * di + dj * dj
+          if (dd < bd) {
+            bd = dd
+            best = c
+          }
+        }
+      }
+      if (best >= 0) return best
+    }
+    return -1
+  }
+  /** id of the walkable area at (or right next to) a point, or -1 */
+  areaAt(x: number, y: number, maxRing = 4): number {
+    const c = this.nearComp(x, y, maxRing)
+    return c < 0 ? -1 : this.comp[c]
+  }
+
+  /** for every cell within 40 m of an area: the nearest cell of that area (-1 elsewhere) */
+  private nearTo(target: number): Int32Array {
+    let near = this.nearCache.get(target)
+    if (near) return near
+    const { gnx, gny, comp, bfsQ, bfsG } = this
+    const n = gnx * gny
+    near = new Int32Array(n).fill(-1)
+    let head = 0
+    let tail = 0
+    for (let c = 0; c < n; c++) {
+      if (comp[c] === target) {
+        near[c] = c
+        bfsG[c] = 0
+        bfsQ[tail++] = c
+      }
+    }
+    while (head < tail) {
+      const c = bfsQ[head++]
+      if (bfsG[c] >= 20) continue
+      const ci = c % gnx
+      const cj = (c - ci) / gnx
+      for (let dj = -1; dj <= 1; dj++) {
+        const nj = cj + dj
+        if (nj < 0 || nj >= gny) continue
+        for (let di = -1; di <= 1; di++) {
+          const ni = ci + di
+          if (ni < 0 || ni >= gnx || (di === 0 && dj === 0)) continue
+          const nb = nj * gnx + ni
+          if (near[nb] >= 0) continue
+          near[nb] = near[c]
+          bfsG[nb] = bfsG[c] + 1
+          bfsQ[tail++] = nb
+        }
+      }
+    }
+    this.nearCache.set(target, near)
+    return near
+  }
+
+  /**
+   * How to get onto a roof at (px,py,pz) from the walkable area we stand in: the launch point beside
+   * the building that costs the least jet energy (and is not a long walk away). Null if out of reach.
+   */
+  roofPlan(x: number, y: number, px: number, py: number, pz: number, maxEnergy = 90): { lx: number; ly: number; tx: number; ty: number; energy: number; rise: number } | null {
+    const s = this.nearComp(x, y, 5)
+    if (s < 0) return null
+    const { gnx, gny, comp, w } = this
+    const mine = comp[s]
+    const c0 = this.cellOf(px, py)
+    const ci0 = c0 % gnx
+    const cj0 = (c0 - ci0) / gnx
+    const R = 16
+    let best = -1
+    let bestScore = Infinity
+    let bestE = 0
+    let bestRise = 0
+    for (let dj = -R; dj <= R; dj++) {
+      const cj = cj0 + dj
+      if (cj < 0 || cj >= gny) continue
+      for (let di = -R; di <= R; di++) {
+        const ci = ci0 + di
+        if (ci < 0 || ci >= gnx) continue
+        const c = cj * gnx + ci
+        if (comp[c] !== mine || !this.walkable(c)) continue
+        const cx = this.cellX(c)
+        const cy = this.cellY(c)
+        const gap = Math.hypot(px - cx, py - cy)
+        if (gap > 2 * R) continue
+        const g0 = w.groundAt(cx, cy)
+        let rise = pz - g0
+        let roofed = false
+        const k = Math.max(1, Math.ceil(gap))
+        for (let i = 0; i <= k; i++) {
+          const idx = w.index(cx + ((px - cx) * i) / k, cy + ((py - cy) * i) / k)
+          const h = w.top[idx] - g0
+          if (h > rise) rise = h
+          if (w.ohBase[idx] < 1e8) roofed = true
+        }
+        if (roofed) continue
+        const e = 1.5 * (Math.max(0, rise) + 3) + 0.85 * gap + 8
+        if (e > maxEnergy) continue
+        const score = e + 0.35 * Math.hypot(cx - x, cy - y)
+        if (score < bestScore) {
+          bestScore = score
+          best = c
+          bestE = e
+          bestRise = rise
+        }
+      }
+    }
+    if (best < 0) return null
+    return { lx: this.cellX(best), ly: this.cellY(best), tx: px, ty: py, energy: bestE, rise: bestRise }
+  }
+
+  /**
+   * How to get from here into another walkable area that no walking route reaches: walk to the
+   * launch point inside our own area, then jump and jet over the wall to the landing point. Picks
+   * the cheapest crossing the jets can manage on maxEnergy. Returns null if there is none.
+   */
+  hopPlan(x: number, y: number, target: number, maxEnergy = 92): { lx: number; ly: number; tx: number; ty: number; energy: number; rise: number } | null {
+    const s = this.nearComp(x, y, 5)
+    if (s < 0) return null
+    const { gnx, gny, comp, bfsQ, bfsG, w, stamp } = this
+    const mine = comp[s]
+    if (mine === target) return null
+    const near = this.nearTo(target)
+    const gen = ++this.gen
+    let head = 0
+    let tail = 0
+    bfsQ[tail++] = s
+    bfsG[s] = 0
+    stamp[s] = gen
+    let best = -1
+    let bestScore = Infinity
+    let bestE = 0
+    let bestRise = 0
+    while (head < tail && head < 90000) {
+      const c = bfsQ[head++]
+      const ci = c % gnx
+      const cj = (c - ci) / gnx
+      const walk = bfsG[c] * CELL
+      if (walk * 0.5 >= bestScore) break
+      const m = near[c]
+      if (m >= 0) {
+        const cx = this.cellX(c)
+        const cy = this.cellY(c)
+        const mx = this.cellX(m)
+        const my = this.cellY(m)
+        const gap = Math.hypot(mx - cx, my - cy)
+        const g0 = w.groundAt(cx, cy)
+        let rise = w.groundAt(mx, my) - g0
+        let roofed = false
+        const k = Math.max(1, Math.ceil(gap))
+        for (let i = 0; i <= k; i++) {
+          const idx = w.index(cx + ((mx - cx) * i) / k, cy + ((my - cy) * i) / k)
+          const h = w.top[idx] - g0
+          if (h > rise) rise = h
+          // something hanging over the way (a bridge deck, an eave) stops a jet
+          if (w.ohBase[idx] < 1e8) roofed = true
+        }
+        if (!roofed) {
+          const e = 1.5 * (Math.max(0, rise) + 3) + 0.85 * gap + 8
+          if (e <= maxEnergy) {
+            const score = walk * 0.5 + e
+            if (score < bestScore) {
+              bestScore = score
+              best = c
+              bestE = e
+              bestRise = rise
+            }
+          }
+        }
+      }
+      for (let dj = -1; dj <= 1; dj++) {
+        const nj = cj + dj
+        if (nj < 0 || nj >= gny) continue
+        for (let di = -1; di <= 1; di++) {
+          const ni = ci + di
+          if (ni < 0 || ni >= gnx || (di === 0 && dj === 0)) continue
+          const nb = nj * gnx + ni
+          if (stamp[nb] === gen || comp[nb] !== mine) continue
+          if (di !== 0 && dj !== 0 && (comp[cj * gnx + ni] !== mine || comp[nj * gnx + ci] !== mine)) continue
+          stamp[nb] = gen
+          bfsG[nb] = bfsG[c] + 1
+          bfsQ[tail++] = nb
+        }
+      }
+    }
+    if (best < 0) return null
+    const lx = this.cellX(best)
+    const ly = this.cellY(best)
+    const m = near[best]
+    let tx = this.cellX(m)
+    let ty = this.cellY(m)
+    // land a little way in, not on the very edge
+    const d = Math.hypot(tx - lx, ty - ly)
+    if (d > 0.1) {
+      const ex = tx + ((tx - lx) / d) * 4
+      const ey = ty + ((ty - ly) / d) * 4
+      if (comp[this.cellOf(ex, ey)] === target) {
+        tx = ex
+        ty = ey
+      }
+    }
+    return { lx, ly, tx, ty, energy: bestE, rise: bestRise }
   }
 
   cellOf(x: number, y: number): number {

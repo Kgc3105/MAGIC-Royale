@@ -21,6 +21,8 @@ const SEED = Number(opts.get("seed") ?? 40000)
 const WORKERS = Number(opts.get("workers") ?? 14)
 const SCENARIO = opts.get("scenario") ?? "gauntlet"
 const BLOCK = 50
+/** extra simulator arguments, e.g. --simargs "--vision hunters" */
+const EXTRA = (opts.get("simargs") ?? "").split(" ").filter(Boolean)
 
 let running = 0
 const queue: (() => void)[] = []
@@ -34,7 +36,7 @@ async function block(cfg: string, seed: number, n: number): Promise<number[]> {
   await slot()
   try {
     return await new Promise<number[]>((resolve) => {
-      const p = spawn(process.execPath, [SIM, "--scenario", SCENARIO, "--matches", String(n), "--seed", String(seed), "--me", cfg], { stdio: ["ignore", "pipe", "ignore"] })
+      const p = spawn(process.execPath, [SIM, "--scenario", SCENARIO, "--matches", String(n), "--seed", String(seed), "--me", cfg, ...EXTRA], { stdio: ["ignore", "pipe", "ignore"] })
       let out = ""
       p.stdout.on("data", (d) => (out += d))
       p.on("close", () => resolve([...out.matchAll(/^seed\s+\d+ \| outlived\s+(\d+)/gm)].map((m) => Number(m[1]))))
@@ -56,6 +58,11 @@ const res = await Promise.all(cfgs.map(evaluate))
 console.log(`${SCENARIO}, ${res[0].length} matches each, seeds from ${SEED} (${((Date.now() - t0) / 60000).toFixed(1)} min)`)
 res.forEach((r, i) => {
   let line = `${mean(r).toFixed(2)}  ${cfgs[i]}`
+  if (i === 0) {
+    const m = mean(r)
+    const sd = Math.sqrt(r.reduce((s, x) => s + (x - m) * (x - m), 0) / Math.max(1, r.length - 1))
+    line += `   (per-match sd ${sd.toFixed(2)}; a 48-match score varies by ±${(sd / Math.sqrt(48)).toFixed(2)})`
+  }
   if (i > 0) {
     const n = Math.min(r.length, res[0].length)
     const d = Array.from({ length: n }, (_, k) => r[k] - res[0][k])
