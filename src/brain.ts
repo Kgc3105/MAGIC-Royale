@@ -51,6 +51,8 @@ type Ctx = {
   fight: boolean
   /** hide-first posture (free-for-all) rather than take-the-fight posture (practice squad) */
   ambush: boolean
+  /** building up before the first kill: no shooting at mechs, keep away from them, farm */
+  power: boolean
   /** sniper posture: we hold a laser, so fight from a corner at range and let them come to us */
   camp: boolean
   /** fight-from-cover mechanics are on (either of the two postures above) */
@@ -84,8 +86,12 @@ const TUNE: Record<string, number> = (() => {
     return {}
   }
 })()
-const tv = (k: string, d: number) => (typeof TUNE[k] === "number" ? TUNE[k] : d)
+/** overrides of the instance that is deciding right now (the simulator runs several bots in one process) */
+let CUR: Record<string, number> | null = null
+const tv = (k: string, d: number) => (CUR && typeof CUR[k] === "number" ? CUR[k] : typeof TUNE[k] === "number" ? TUNE[k] : d)
 const envFlag = (name: string, dflt: string) => ((typeof process !== "undefined" && process.env?.[name]) || dflt) === "1"
+/** farm before fighting (practice only); MECH_POWER=0/1 overrides for local testing */
+const POWER = envFlag("MECH_POWER", "0")
 /** rehearse decisions before the match so the runtime compiles them early; MECH_REHEARSE=0/1 */
 const REHEARSE = envFlag("MECH_REHEARSE", "1")
 /** go for a supply drop even with mechs in contact; MECH_DROP=0/1 overrides for local testing */
@@ -147,6 +153,7 @@ export class Brain {
   /** the match looks like a free-for-all (mechs are dying that we did not kill) */
   ffa = false
   private myKills = 0
+  private dropsTaken = 0
   private chaseId = -1
   private chaseBest = Infinity
   private chaseT = 0
@@ -171,8 +178,22 @@ export class Brain {
   private zSame = 0
   private zStatic = false
   private lastSawTargetT = -1e9
+  /** still building up: avoiding fights and farming (see updatePower) */
+  power = true
+  powerEnded = ""
+  /** mech id -> last time it damaged us */
+  private hurtBy = new Map<number, number>()
+  private visitT = new Float32Array(0)
+  private exploreX = NaN
+  private exploreY = NaN
+  private exploreT = -1e9
 
-  constructor(hello: Hello, shared?: { world: World; nav: Nav }) {
+  private stance: string | null
+  private tuneOv: Record<string, number> | null
+
+  constructor(hello: Hello, shared?: { world: World; nav: Nav }, opts?: { stance?: string; tune?: Record<string, number> }) {
+    this.stance = opts?.stance ?? null
+    this.tuneOv = opts?.tune ?? null
     this.cfg = hello.config
     this.world = shared?.world ?? new World(hello.map.dir, hello.map.files)
     this.nav = shared?.nav ?? new Nav(this.world)
@@ -280,6 +301,7 @@ export class Brain {
 
   // ------------------------------------------------------------------------------------------ main
   act(obs: Observation): BotAction {
+    CUR = this.tuneOv
     const me = obs.self
     const S = me.stats
     const radius = S.radius ?? this.cfg.mech.radius ?? 2.5
@@ -375,6 +397,7 @@ export class Brain {
             this.alertUntil = t + 2.5
             if (e.by != null && e.by >= 0 && e.by < 100) {
               this.lastMechHurtT = t
+              this.hurtBy.set(e.by, t)
               const k = this.tracks.get(e.by)
               const D = k ? clamp(dist2(x, y, k.x, k.y), 30, 250) : e.weapon === "lightning" ? 35 : 110
               guess(e.by, x + Math.cos(e.bearing) * D, y + Math.sin(e.bearing) * D, e.weapon, 1)
@@ -385,7 +408,8 @@ export class Brain {
       else if (e.type === "take_failed") {
         if (e.reason === "gone") this.pickups.delete(e.id)
         else this.ignore.set(e.id, t + (e.reason === "range" ? 1 : 20))
-      } else if (e.type === "kill") {
+      } else if (e.type === "drop") this.dropsTaken++
+      else if (e.type === "kill") {
         this.tracks.delete(e.target)
         this.myKills++
       }
@@ -556,6 +580,8 @@ export class Brain {
     let targetDist = Infinity
     let bestScore = -1e9
     let unseenShooter = false
+    /** the chosen target has its back or side to us: it is fighting someone else */
+    let targetAway = false
     for (const k of threats) {
       if (k.phantom) {
         if (t - k.seen < 1.5) {
@@ -577,11 +603,14 @@ export class Brain {
       let s = -d / 60 - (k.hp / Math.max(1, k.maxHp)) * 1.5 + (los ? 2.5 : 0)
       if (k.id === this.targetId) s += 0.6
       if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) s += 1
+      const away = Math.abs(wrap(Math.atan2(y - k.y, x - k.x) - k.yaw)) > 1.3
+      if (away && tv("tp", 0) > 0) s += 1.2 + (1 - k.hp / Math.max(1, k.maxHp))
       if (s > bestScore) {
         bestScore = s
         target = { ...k, aimFrac: frac }
         targetLos = los
         targetDist = d
+        targetAway = away
       }
     }
     const tk0 = target as Aimable | null
@@ -608,12 +637,14 @@ export class Brain {
       if (!hide) {
         if (nT > 0 && hpFrac < (nT >= 2 ? 0.7 : 0.45) && !finishable) hide = true
         if (nT >= 3) hide = true
+        if (nT >= 2 && tv("ffa2hide", 0) > 0 && !finishable && !(targetAway && !underFire)) hide = true
         if (unseenShooter && underFire && !tk0) hide = true
         if (outgunned && hpFrac < 0.85 && !finishable) hide = true
       } else if (nT === 0) {
         if (hpFrac > 0.85 || t - this.lastThreatT > 10) hide = false
       } else if (nT === 1 && ((hpFrac > 0.85 && !unseenShooter && !outgunned) || finishable)) hide = false
-      fight = nT > 0 && !hide && !!tk0 && (targetDist <= 120 || hurtByMech || finishable)
+      const freeShot = tv("tp", 0) > 0 && targetAway && targetLos && !underFire && targetDist <= (sLaser >= 0 ? 250 : 150)
+      fight = nT > 0 && !hide && !!tk0 && (targetDist <= 120 || hurtByMech || finishable || freeShot)
     } else {
       // practice squad: they never fight each other, so a house bot only dies if we kill it.
       // Take the fight while healthy, break off when losing.
@@ -627,6 +658,19 @@ export class Brain {
       fight = !hide && !!tk0 && (camp || (targetLos && targetDist <= 175) || targetDist <= 60 || hurtByMech)
     }
     if (king) hide = false
+    const power = this.updatePower(obs, hpFrac, ambush, king)
+    if (power) {
+      // not yet: leave the hunter alone, farm, and let the escalation wait
+      hide = false
+      fight = false
+      // still shoot back at a mech that is on top of us or already hitting us
+      const defend = !!tk0 && (hurtByMech || targetDist < tv("pDefend", 60))
+      if (!defend) {
+        target = null
+        targetLos = false
+        targetDist = Infinity
+      }
+    }
     this.evading = hide
     if (hide) fight = false
     // in a free-for-all, a mech we are not fighting is one to stay hidden from
@@ -647,7 +691,11 @@ export class Brain {
         }
       }
       // shooting anything restarts the repair timer, so only farm at full health and with nobody about
-      const calm = nT === 0 && !underFire && !hide && hpFrac >= 0.9 && t - this.lastThreatT > 6 && me.cubes < 14 && me.in_zone
+      let nearMech = Infinity
+      for (const k of threats) nearMech = Math.min(nearMech, dist2(x, y, k.x, k.y))
+      const calm = power
+        ? me.in_zone && nearMech > 60
+        : nT === 0 && !underFire && !hide && hpFrac >= 0.9 && t - this.lastThreatT > 6 && me.cubes < 14 && me.in_zone
       for (const k of this.tracks.values()) {
         if (k.kind !== "npc" || k.seen < t - 0.01) continue
         const angry = k.id === this.lastHurtBy && t - this.lastHurtT < 6
@@ -662,7 +710,7 @@ export class Brain {
 
     // peek logic: want a line of fire when a weapon is ready, want to be hidden when none is
     let wantLos = 0
-    if (nT > 0 && tk0 && (ambush || camp || fight)) {
+    if (!power && nT > 0 && tk0 && (ambush || camp || fight)) {
       if (!fight) wantLos = -1.6
       else {
         let ready = false
@@ -687,12 +735,130 @@ export class Brain {
       }
     }
 
-    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, camp, cover: ambush || camp, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
+    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, power, camp, cover: ambush || camp, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
+  }
+
+  /**
+   * Practice only. Every house bot we kill brings another hunter, so the escalation should start
+   * when we are strong, not at spawn. Until then: do not shoot mechs, keep away from them, and
+   * collect cubes, a laser and supply drops. Ends for good on the first of: strong enough, out of
+   * time, hurt, shot at by several mechs, a kill, or the match turning out to be a free-for-all.
+   */
+  private updatePower(obs: Observation, hpFrac: number, ambush: boolean, king: boolean): boolean {
+    // the rat posture can begin late (once the match is recognised as a free-for-all)
+    if (!this.power && !king && tv("rat", 0) > 0 && (ambush || this.ffa)) this.power = true
+    if (!this.power) return false
+    const t = obs.t
+    let attackers = 0
+    for (const at of this.hurtBy.values()) if (t - at < 8) attackers++
+    // free-for-all "rat" play: keep out of everyone's way until the last circles (tune rat=1)
+    const rat = tv("rat", 0) > 0 && (ambush || this.ffa)
+    let end = ""
+    if (tv("power", POWER ? 1 : 0) <= 0 && !rat) end = "off"
+    else if (king) end = "endgame"
+    else if (rat) end = ""
+    else if (ambush || this.ffa) end = "free-for-all"
+    else if (this.myKills > 0) end = "kill"
+    else if (obs.self.cubes >= tv("pCubes", 10)) end = "strong"
+    else if (t >= tv("pT", 120)) end = "time"
+    else if (hpFrac < tv("pHp", 0.5)) end = "hurt"
+    else if (attackers >= 2) end = "several attackers"
+    if (end) {
+      this.power = false
+      this.powerEnded = `${end}@${t.toFixed(0)}s`
+    }
+    return this.power
+  }
+
+  /** a spot a good walk away that puts distance (and ideally a building) between us and the mechs */
+  private fleePoint(obs: Observation, c: Ctx, foes: Track[]): [number, number] | null {
+    const { x, y, t } = c
+    const w = this.world
+    const soon = this.zoneAt(obs, t + 8)
+    const zn = obs.zone
+    const late = t > zn.shrink_start - 30
+    let cur = Infinity
+    for (const k of foes) cur = Math.min(cur, dist2(x, y, k.x, k.y))
+    let best = -1e9
+    let out: [number, number] | null = null
+    for (const r of [45, 80, 120]) {
+      for (let i = 0; i < NDIR; i++) {
+        const px = x + DIRX[i] * r
+        const py = y + DIRY[i] * r
+        if (!this.nav.free(px, py)) continue
+        if (dist2(px, py, soon.cx, soon.cy) > soon.r - 10) continue
+        if (late && dist2(px, py, zn.next_center[0], zn.next_center[1]) > zn.next_radius - 8) continue
+        let near = Infinity
+        let seen = 0
+        const gz = w.groundAt(px, py) + c.height * 0.5
+        for (const k of foes) {
+          near = Math.min(near, dist2(px, py, k.x, k.y))
+          if (w.losClear(k.x, k.y, k.z + k.h * 0.89, px, py, gz)) seen++
+        }
+        const sc = near - cur - seen * 35 - (this.nav.segOk(x, y, px, py) ? 0 : 15)
+        if (sc > best) {
+          best = sc
+          out = [px, py]
+        }
+      }
+    }
+    return out
+  }
+
+  /** somewhere inside the zone we have not looked at lately, away from the mechs */
+  private explorePoint(obs: Observation, c: Ctx, foes: Track[], ok: (px: number, py: number) => boolean): [number, number] {
+    const { x, y, t } = c
+    const w = this.world
+    const G = 40
+    const gw = Math.ceil((w.bMaxX - w.bMinX) / G)
+    const gh = Math.ceil((w.bMaxY - w.bMinY) / G)
+    if (this.visitT.length !== gw * gh) this.visitT = new Float32Array(gw * gh).fill(-1e9)
+    // what we can see from here counts as looked at
+    const ci = Math.floor((x - w.bMinX) / G)
+    const cj = Math.floor((y - w.bMinY) / G)
+    for (let dj = -2; dj <= 2; dj++) {
+      for (let di = -2; di <= 2; di++) {
+        const i = ci + di
+        const j = cj + dj
+        if (i >= 0 && j >= 0 && i < gw && j < gh) this.visitT[j * gw + i] = t
+      }
+    }
+    if (Number.isFinite(this.exploreX) && t - this.exploreT < 10 && dist2(x, y, this.exploreX, this.exploreY) > 25 && ok(this.exploreX, this.exploreY)) return [this.exploreX, this.exploreY]
+    let best = -1e9
+    let bx = obs.zone.next_center[0]
+    let by = obs.zone.next_center[1]
+    for (let j = 0; j < gh; j++) {
+      for (let i = 0; i < gw; i++) {
+        const px = w.bMinX + (i + 0.5) * G
+        const py = w.bMinY + (j + 0.5) * G
+        if (!ok(px, py)) continue
+        const d = dist2(x, y, px, py)
+        if (d < 50 || d > 320) continue
+        if (this.nav.clearAt(px, py) < this.nav.need + 1) continue
+        let sc = Math.min(3, (t - this.visitT[j * gw + i]) / 60) - d / 160
+        for (const k of foes) {
+          const kd = dist2(px, py, k.x, k.y)
+          if (kd < 160) sc -= 3
+          const fd = dist2(x, y, k.x, k.y)
+          if (fd < 320 && ((px - x) * (k.x - x) + (py - y) * (k.y - y)) / (Math.max(1, d) * Math.max(1, fd)) > 0.4) sc -= 1.5
+        }
+        if (sc > best) {
+          best = sc
+          bx = px
+          by = py
+        }
+      }
+    }
+    this.exploreX = bx
+    this.exploreY = by
+    this.exploreT = t
+    return [bx, by]
   }
 
   /** hide-first posture? Forced by MECH_STANCE=ambush|brawl, otherwise on once the match looks like a free-for-all. */
   private ambushStance(): boolean {
-    return STANCE === "ambush" ? true : STANCE === "brawl" ? false : this.ffa
+    const st = this.stance ?? STANCE
+    return st === "ambush" ? true : st === "brawl" ? false : this.ffa
   }
 
   // ------------------------------------------------------------------------------------------ goal
@@ -728,15 +894,70 @@ export class Brain {
       const ky = cell >= 0 && !this.nav.free(zn.next_center[0], zn.next_center[1], 0.5) ? this.nav.cellY(cell) : zn.next_center[1]
       return { x: kx, y: ky, arrive: 0.5, why: "king", boost: dist2(x, y, kx, ky) > zn.next_radius + 10, travel: true }
     }
+    if (c.power) {
+      const foes: Track[] = []
+      // which mechs to keep away from: all of them (pAvoid 2), only ones that have shot us (1), none (0)
+      const avoid = tv("pAvoid", 1)
+      for (const k of this.tracks.values()) {
+        if (k.kind !== "mech" || t - k.seen >= 8 || avoid === 0) continue
+        if (avoid >= 2 || t - (this.hurtBy.get(k.id) ?? -1e9) < 20) foes.push(k)
+      }
+      let fd = Infinity
+      for (const k of foes) fd = Math.min(fd, dist2(x, y, k.x, k.y))
+      // a mech is getting close: open the distance before anything else (gun fire can be dodged
+      // beyond about 110 m and does not reach past 230 m)
+      const keep = tv("pKeep", 150)
+      if (fd < keep) {
+        const away = this.fleePoint(obs, c, foes)
+        if (away) return { x: away[0], y: away[1], arrive: 3, why: "power-away", boost: fd < keep - 40 && me.energy > 25, travel: true }
+      }
+      type Pick = { id: number; x: number; y: number; arrive: number; why: string; lim: number }
+      const picks: Pick[] = []
+      let ps = 0
+      const consider = (id: number, px: number, py: number, value: number, arrive: number, why: string, lim: number) => {
+        if (skip(id) || !okSpot(px, py)) return
+        const d = dist2(x, y, px, py)
+        if (d > 360) return
+        let sc = value / (d + 40)
+        for (const k of foes) {
+          const kd = dist2(px, py, k.x, k.y)
+          if (kd < 110) return
+          if (kd < d + 30) sc *= 0.3
+          const f = dist2(x, y, k.x, k.y)
+          if (f < 300 && ((px - x) * (k.x - x) + (py - y) * (k.y - y)) / (Math.max(1, d) * Math.max(1, f)) > 0.5) sc *= 0.4
+        }
+        if (sc > ps) {
+          ps = sc
+          picks[0] = { id, x: px, y: py, arrive, why, lim }
+        }
+      }
+      for (const d of obs.drops) {
+        const dd = dist2(x, y, d.pos[0], d.pos[1])
+        if (d.lands_in <= dd / (c.walk * 0.75) + 12) consider(d.id, d.pos[0], d.pos[1], 600, 1.5, "power-drop", 18)
+      }
+      for (const it of this.cubes.values()) if (!it.roof) consider(it.id, it.x, it.y, 160, 0.8, "power-cube", 7)
+      for (const it of this.pickups.values()) {
+        if (it.roof) continue
+        const gain = this.pickupGain(me.weapons, it.kind, live.r)
+        if (gain > 0) consider(it.id, it.x, it.y, it.kind === "laser" ? 420 : 50 * gain, 1.2, `power-${it.kind}`, 9)
+      }
+      for (const it of this.crates.values()) if (!it.roof) consider(it.id, it.x, it.y, 110, 5, "power-crate", 12)
+      if (c.hpFrac > 0.6) for (const k of this.tracks.values()) if (k.kind === "npc" && t - k.seen < 10) consider(k.id, k.x, k.y, 190, 70, "power-drone", 16)
+      const pk = picks[0]
+      if (pk && chase(pk.id, dist2(x, y, pk.x, pk.y), pk.lim)) return { x: pk.x, y: pk.y, arrive: pk.arrive, why: pk.why, boost: false, travel: true }
+      const [ex, ey] = this.explorePoint(obs, c, foes, okSpot)
+      return { x: ex, y: ey, arrive: 8, why: "power-explore", boost: false, travel: true }
+    }
+
     // ---- a supply drop is a second life (full repair, full energy, 3 cubes): go for it under fire.
     // It only needs us alone in its ring for a few seconds; being shot at does not stop the capture.
-    if (DROP_UNDER_FIRE && c.threats.length > 0) {
+    if ((DROP_UNDER_FIRE || tv("drop", 0) > 0) && c.threats.length > 0) {
       for (const d of obs.drops) {
         if (skip(d.id)) continue
         const dd = dist2(x, y, d.pos[0], d.pos[1])
-        if (dd > 240) continue
+        if (dd > tv("dropReach", 240)) continue
         // set off in time to be standing there when it lands, not earlier
-        if (d.lands_in > dd / (c.walk * 0.75) + 6) continue
+        if (d.lands_in > dd / (c.walk * 0.75) + tv("dropLead", 6)) continue
         if (d.holder != null && d.holder !== me.id && d.progress > 1.5) continue
         if (dd > 8 && !chase(d.id, dd, 16)) continue
         return { x: d.pos[0], y: d.pos[1], arrive: 2.5, why: "grab-drop", boost: dd > 30 && me.energy > 35, travel: true }
@@ -1219,8 +1440,8 @@ export class Brain {
           s += coverW * c.wantLos * ((l1 ? 1.3 : -1.3) + (l2 ? 0.6 : -0.6))
         }
       }
-      if (c.evade || c.threats.length > 1) {
-        const wgt = (c.evade ? 1.2 : 0.45) * coverW
+      if (c.evade || c.power || c.threats.length > 1) {
+        const wgt = (c.evade ? 1.2 : c.power ? 0.7 : tv("multiCover", 0.45)) * coverW
         const g1 = w.groundAt(p1x, p1y) + c.height * 0.5
         let n = 0
         for (const k of c.threats) {
@@ -1273,7 +1494,10 @@ export class Brain {
     const repairing = mechT && c.evade && c.hpFrac < 0.85 && t - this.lastHurtT > 1 && T!.hp > 0.25 * T!.maxHp && c.targetDist > 45
     // free-for-all: do not pick a fight with a distant mech that is leaving us alone
     const unprovoked = mechT && c.ambush && !c.fight && t - this.lastMechHurtT > 3 && T!.hp > 0.35 * T!.maxHp
-    const holdFire = repairing || unprovoked
+    // optional pacing: each kill brings another hunter, so after paceK kills wait for the first supply
+    // drop (a full repair) before making more, unless the mech is nearly dead or on top of us
+    const pacing = mechT && tv("paceK", 0) > 0 && this.myKills >= tv("paceK", 0) && this.dropsTaken === 0 && t < tv("paceT", 104) && !c.ambush && T!.hp > 0.3 * T!.maxHp && c.targetDist > 50 && c.hpFrac > 0.45
+    const holdFire = repairing || unprovoked || pacing
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
     const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > 0.3)

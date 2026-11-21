@@ -31,6 +31,9 @@ const SKILL = args.get("skill") ?? "medium"
 const STATIC_ZONE = args.has("static-zone")
 /** hunters always know where the bot is (the first, harsher model) instead of sharing vision */
 const OMNISCIENT = args.has("omniscient")
+const HUNT_DELAY = Number(args.get("delay") ?? 0)
+/** when every house bot joins the hunt regardless of kills (our guess at "late in the match") */
+const LATE_T = Number(args.get("late") ?? 255)
 const TRACE = args.has("trace")
 
 const hello0: Hello = JSON.parse(gunzipSync(readFileSync(`${decodeURIComponent(KIT)}/check/stream.jsonl.gz`)).toString("utf8").split("\n")[0])
@@ -255,6 +258,8 @@ class Dummy {
   home: [number, number] = [0, 0]
   search: [number, number] | null = null
   searchT = -1
+  lastTgt = -1
+  lastTgtT = -1e9
   constructor(skill: string, seed: number) {
     this.skill = SKILLS[skill] ?? SKILLS.medium
     this.rnd = mulberry32(seed)
@@ -384,7 +389,7 @@ class Dummy {
 }
 
 // ------------------------------------------------------------------------------------------ match
-type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number>; src: Record<string, number>; activeEnd: number; killT: number[] }
+type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number>; src: Record<string, number>; activeEnd: number; killT: number[]; pend: string; cubesAtEnd: number }
 
 function runMatch(seed: number): Result {
   const rnd = mulberry32(seed * 7919 + 17)
@@ -461,12 +466,61 @@ function runMatch(seed: number): Result {
 
   // what-if switches: start the bot with cubes or a weapon to measure how much they are worth
   if (args.has("weapon")) me.weapons[1] = mkWpn(args.get("weapon")!)
-  const brain = new Brain({ ...hello0, slot: 0, seed: seed * 2654435761 })
+  // --me '{"key":value}' tunes only our bot; --stance forces its posture
+  const brain = new Brain({ ...hello0, slot: 0, seed: seed * 2654435761 }, { world, nav: new Nav(world) }, { tune: args.has("me") ? JSON.parse(args.get("me")!) : undefined, stance: args.get("stance") })
   const bullets: Bullet[] = []
   let beams: Observation["beams"] = []
   let events: Observation["events"] = []
   let pendingOffer: { id: number; choices: { id: string; name: string; desc: string }[]; expires: number } | null = null
   let offerId = 1
+  // ---- free-for-all rivals: copies of this bot. Most play the practice style (other teams tuned
+  // for the practice board and will brawl); every third one adapts to a free-for-all as ours does.
+  type Pilot = { brain: Brain; events: Observation["events"]; offer: Observation["offer"]; mem: Map<number, number>; beams: Observation["beams"] }
+  const rivals = new Map<number, Pilot>()
+  if (SCENARIO === "ffa") {
+    const nRival = Math.min(mechs.length - 1, Number(args.get("rivals") ?? 9))
+    for (let i = 1; i <= nRival; i++) {
+      mechs[i].ai = null
+      mechs[i].weapons[1] = null
+      rivals.set(i, {
+        brain: new Brain({ ...hello0, slot: i, seed: (seed * 7 + i * 1009) >>> 0 }, { world, nav: new Nav(world) }, { stance: i % 3 === 0 ? "auto" : "brawl" }),
+        events: [], offer: null, mem: new Map(), beams: [],
+      })
+    }
+  }
+  /** can mech o see a point (distance, view cone, line of sight)? */
+  const canSee = (o: Mech, x: number, y: number, z1: number, z2: number) => {
+    const d = Math.hypot(x - o.x, y - o.y)
+    if (d > cfg.vision.range) return false
+    if (d > cfg.vision.near_range && Math.abs(wrap(Math.atan2(y - o.y, x - o.x) - o.yaw)) > (cfg.vision.fov_deg * Math.PI) / 360) return false
+    const ez = o.z + o.stats.eye_height
+    return world.losClear(o.x, o.y, ez, x, y, z1) || world.losClear(o.x, o.y, ez, x, y, z2)
+  }
+  const doTake = (o: Mech, a: BotAction, ev: Observation["events"]) => {
+    if (a.take == null) return
+    const l = pickups.find((q) => q.id === a.take)
+    if (!l) return void ev.push({ type: "take_failed", id: a.take, reason: "gone" })
+    if (Math.hypot(l.x - o.x, l.y - o.y) > cfg.loot.pickup_radius || Math.abs(l.z - o.z) > 4) return void ev.push({ type: "take_failed", id: l.id, reason: "range" })
+    if (o.weapons.some((w) => w?.kind === l.kind)) return void ev.push({ type: "take_failed", id: l.id, reason: "have" })
+    let slot = o.weapons.findIndex((w) => !w)
+    if (slot < 0 && (a.drop === 0 || a.drop === 1)) {
+      slot = a.drop
+      pickups.push({ id: nextId++, kind: o.weapons[slot]!.kind, x: o.x, y: o.y, z: o.z, hp: 0 })
+    }
+    if (slot < 0) return void ev.push({ type: "take_failed", id: l.id, reason: "full" })
+    const w = mkWpn(l.kind)
+    for (const id of o.upgrades) {
+      const u = cfg.upgrades.find((q) => q.id === id)
+      for (const e of u?.effects ?? []) {
+        const path = e.path.split(".")
+        if (path[0] === "weapons" && path[1] === l.kind) w.stats[path[2]] = (w.stats[path[2]] ?? 0) * (e.mul ?? 1) + (e.add ?? 0)
+      }
+    }
+    w.cooldown = Math.max(cfg.loot.equip_s, w.stats.cooldown ?? 0)
+    o.weapons[slot] = w
+    pickups.splice(pickups.indexOf(l), 1)
+    ev.push({ type: "took", id: l.id, kind: l.kind as never, slot })
+  }
   let kills = 0, dealt = 0, taken = 0, zoneDmg = 0, stuck = 0, err = 0, travelled = 0
   const times: number[] = []
   const modes: Record<string, number> = {}
@@ -480,6 +534,7 @@ function runMatch(seed: number): Result {
   const src: Record<string, number> = {}
   const killT: number[] = []
   let activeEnd = 0
+  let cubesAtEnd = -1
   let decTicks = 0
   let stillTicks = 0
   let deadBeforeMe = 0
@@ -512,6 +567,11 @@ function runMatch(seed: number): Result {
       events.push({ type: "pickup", cubes: m.cubes })
       if (cfg.cubes.upgrade_thresholds.includes(m.cubes)) m.offers.push(t)
     }
+    const rvc = rivals.get(m.id)
+    if (rvc) {
+      rvc.events.push({ type: "pickup", cubes: m.cubes })
+      if (cfg.cubes.upgrade_thresholds.includes(m.cubes)) m.offers.push(t)
+    }
   }
   const hurt = (v: Mech, amount: number, weapon: string, by: Mech | null, sx: number, sy: number, t: number) => {
     if (!v.alive) return
@@ -527,11 +587,15 @@ function runMatch(seed: number): Result {
       if (weapon === "zone") zoneDmg += a
       else {
         taken += a
-        const sk = by?.ai ? (Object.entries(SKILLS).find(([, v]) => v === by.ai!.skill)?.[0] ?? "?") : "?"
+        const sk = by?.ai ? (Object.entries(SKILLS).find(([, v]) => v === by.ai!.skill)?.[0] ?? "?") : by && rivals.has(by.id) ? "rival" : "?"
         src[`${sk}/${weapon}`] = (src[`${sk}/${weapon}`] ?? 0) + a
         if (rear) src.rear = (src.rear ?? 0) + a
       }
     }
+    const rvV = rivals.get(v.id)
+    if (rvV) rvV.events.push({ type: "damaged", amount: a, weapon, bearing: weapon === "zone" ? null : bearing, by: by ? by.id : null, ...(rear ? { rear: true } : {}) })
+    const rvB = by ? rivals.get(by.id) : undefined
+    if (rvB) rvB.events.push({ type: "hit", target: v.id, amount: a, weapon })
     if (by && by.id === 0) {
       events.push({ type: "hit", target: v.id, amount: a, weapon })
       dealt += a
@@ -541,6 +605,7 @@ function runMatch(seed: number): Result {
     if (v.hp <= 0) {
       v.alive = false
       v.diedAt = t
+      if (rvB) rvB.events.push({ type: "kill", target: v.id })
       if (by && by.id === 0) {
         kills++
         killT.push(t)
@@ -606,7 +671,8 @@ function runMatch(seed: number): Result {
       // ---- hunters: one at first, one more per kill, all of them late (our guess at "late")
       const aliveOthers = mechs.filter((m) => m.ai && m.alive)
       const dead = mechs.length - 1 - aliveOthers.length
-      const wantActive = SCENARIO === "duel" ? 1 : t > 255 ? 99 : 1 + dead
+      // --delay N: what if nobody hunted the bot for the first N seconds (upper bound on farming first)
+      const wantActive = SCENARIO === "duel" ? 1 : t < HUNT_DELAY ? 0 : t > LATE_T ? 99 : 1 + dead
       let act = aliveOthers.filter((m) => m.ai!.active).length
       for (const m of aliveOthers) {
         if (act >= wantActive) break
@@ -647,12 +713,17 @@ function runMatch(seed: number): Result {
           for (const o of mechs) {
             if (o === m || !o.alive) continue
             const d = Math.hypot(o.x - m.x, o.y - m.y)
-            if (d < bd) {
+            if (d < bd && (OMNISCIENT || canSee(m, o.x, o.y, o.z + o.stats.height * 0.5, o.z + o.stats.height))) {
               bd = d
               tgt = o
             }
           }
-          m.cmd = m.ai!.decide(m, tgt, t, zinfo, true, believed)
+          const ai = m.ai!
+          if (tgt) {
+            ai.lastTgt = tgt.id
+            ai.lastTgtT = t
+          } else if (ai.lastTgt >= 0 && t - ai.lastTgtT < 5 && mechs[ai.lastTgt].alive) tgt = mechs[ai.lastTgt]
+          m.cmd = ai.decide(m, tgt, t, zinfo, true, believed)
         }
       } else for (const m of aliveOthers) m.cmd = m.ai!.decide(m, me, t, zinfo, seen, believed)
 
@@ -712,6 +783,7 @@ function runMatch(seed: number): Result {
       events = []
       beams = []
       if (laserT < 0 && me.weapons.some((w) => w?.kind === "laser")) laserT = t
+      if (cubesAtEnd < 0 && brain.powerEnded) cubesAtEnd = me.cubes
       if (obsMechs.length) {
         conT++
         if (obsMechs.some((o) => world.losClear(me.x, me.y, me.z + 7, o.pos[0], o.pos[1], o.pos[2] + 4.5))) losT++
@@ -782,6 +854,71 @@ function runMatch(seed: number): Result {
         }
       } else stillTicks = 0
       lastPos = [me.x, me.y]
+
+      // ---- rival bots: each gets its own observation and decides exactly as ours does
+      for (const [rid, st] of rivals) {
+        const o = mechs[rid]
+        if (!o.alive) continue
+        const list: Observation["mechs"] = []
+        for (const m of mechs) {
+          if (m === o || !m.alive) continue
+          if (canSee(o, m.x, m.y, m.z + m.stats.height * 0.5, m.z + m.stats.height)) st.mem.set(m.id, t + (cfg.vision.memory_s ?? 5))
+          if (t <= (st.mem.get(m.id) ?? -1)) list.push({ id: m.id, kind: "mech", pos: [m.x, m.y, m.z], vel: [m.vx, m.vy, m.vz], aim: [m.yaw, m.pitch], hp: m.hp, max_hp: maxHp(m), cubes: m.cubes, weapons: m.weapons.filter((w) => w).map((w) => w!.kind) as never, charging: m.weapons.some((w) => w?.kind === "laser" && w.charge > 0) })
+        }
+        const oitem = (l: Loot) => canSee(o, l.x, l.y, l.z + 1, l.z + 2)
+        if (st.offer && t > st.offer.expires) {
+          applyUpgrade(o, st.offer.choices[0].id)
+          st.events.push({ type: "upgrade", id: st.offer.choices[0].id })
+          st.offer = null
+        }
+        if (!st.offer && o.offers.length) {
+          o.offers.shift()
+          const held = new Set(o.weapons.filter((w) => w).map((w) => w!.kind))
+          const pool = cfg.upgrades.filter((u) => (!u.requires || held.has(u.requires)) && o.upgrades.filter((q) => q === u.id).length < u.max)
+          const ch: typeof pool = []
+          while (ch.length < 3 && pool.length) ch.push(pool.splice(Math.floor(rnd() * pool.length), 1)[0])
+          if (ch.length) st.offer = { id: offerId++, choices: ch.map((u) => ({ id: u.id, name: u.name, desc: u.desc })), expires: t + 5 }
+        }
+        const obsR: Observation = {
+          type: "obs", tick, t: Math.round(t * 100) / 100, alive: mechs.filter((m) => m.alive).length,
+          self: {
+            id: rid, pos: [o.x, o.y, o.z], vel: [o.vx, o.vy, o.vz], aim: [o.yaw, o.pitch], hp: o.hp, max_hp: maxHp(o), energy: o.energy, max_energy: o.stats.energy, grounded: o.grounded,
+            cubes: o.cubes, upgrades: o.upgrades, in_zone: Math.hypot(o.x - lz.cx, o.y - lz.cy) <= lz.r,
+            weapons: o.weapons.map((w) => (w ? { kind: w.kind, cooldown: Math.max(0, w.cooldown), ...(w.kind === "gun" ? { ammo: w.ammo, reload: Math.max(0, w.reload) } : {}), ...(w.kind === "laser" ? { charge: Math.min(w.charge, w.stats.charge) } : {}), stats: w.stats } : null)) as never,
+            stats: o.stats,
+          },
+          mechs: list,
+          projectiles: bullets.filter((b) => b.by !== rid && Math.hypot(b.x - o.x, b.y - o.y) < 200).map((b) => ({ id: b.id, kind: b.kind, pos: [b.x, b.y, b.z], vel: [b.vx, b.vy, b.vz] })),
+          crates: crates.filter(oitem).map((l) => ({ id: l.id, pos: [l.x, l.y, l.z], hp: l.hp })),
+          cubes: cubes.filter(oitem).map((l) => ({ id: l.id, pos: [l.x, l.y, l.z] })),
+          pickups: pickups.filter(oitem).map((l) => ({ id: l.id, kind: l.kind as never, pos: [l.x, l.y, l.z] })),
+          sounds: [], beams: st.beams, events: st.events,
+          zone: { center: [lz.cx, lz.cy], radius: lz.r, next_center: [next.cx, next.cy], next_radius: next.r, shrink_start: lz.ss, shrink_end: lz.se, dps: p.dps },
+          offer: st.offer,
+          drops: drops.map((d) => ({ id: d.id, pos: [d.x, d.y, d.z], radius: cfg.drops?.radius ?? 8, lands_in: Math.max(0, d.lands - t), capture_s: cfg.drops?.capture_s ?? 4, progress: d.progress, holder: d.holder })),
+        }
+        st.events = []
+        st.beams = []
+        let ar: BotAction
+        try {
+          ar = st.brain.act(obsR)
+        } catch (e) {
+          if (err++ < 3) console.error(`seed ${seed} t ${t.toFixed(1)}: rival ${rid} threw`, e)
+          ar = {}
+        }
+        if (ar.pick != null && st.offer) {
+          const ch = st.offer.choices[clamp(ar.pick | 0, 0, st.offer.choices.length - 1)]
+          applyUpgrade(o, ch.id)
+          st.events.push({ type: "upgrade", id: ch.id })
+          st.offer = null
+        }
+        doTake(o, ar, st.events)
+        if (ar.reload) {
+          const g = o.weapons.find((w) => w?.kind === "gun")
+          if (g && g.reload <= 0 && g.ammo < g.stats.mag) g.reload = g.stats.reload
+        }
+        o.cmd = ar
+      }
     }
 
     // ---- simulate one tick
@@ -828,8 +965,15 @@ function runMatch(seed: number): Result {
             if (m.id === 0) ls++
             const [v, dd] = rayHit(m, m.x, m.y, mzl, ux, uy, uz, w.stats.range)
             // our bot sees a beam when either end is in view; one that hits it always is
-            if (m.id !== 0 && (v === me || Math.hypot(m.x - me.x, m.y - me.y) < cfg.vision.near_range))
-              beams.push({ by: m.id, kind: "laser", path: [[m.x, m.y, mzl], [m.x + ux * dd, m.y + uy * dd, mzl + uz * dd]], age: 0.05 })
+            {
+              const ex = m.x + ux * dd, ey = m.y + uy * dd, ezz = mzl + uz * dd
+              const beam = { by: m.id, kind: "laser" as const, path: [[m.x, m.y, mzl], [ex, ey, ezz]] as [number, number, number][], age: 0.05 }
+              if (m.id !== 0 && me.alive && (v === me || canSee(me, m.x, m.y, mzl, mzl) || canSee(me, ex, ey, ezz, ezz))) beams.push(beam)
+              for (const [rid, st] of rivals) {
+                const o = mechs[rid]
+                if (rid !== m.id && o.alive && (v === o || canSee(o, m.x, m.y, mzl, mzl) || canSee(o, ex, ey, ezz, ezz))) st.beams.push(beam)
+              }
+            }
             const clearShot = !!v && world.losClear(m.x, m.y, mzl, m.x + ux * dd, m.y + uy * dd, mzl + uz * dd)
             // a beam that meets no mech can still break a crate
             let crateHit = false
@@ -981,18 +1125,18 @@ function runMatch(seed: number): Result {
       }
     }
     if (!me.alive) {
-      deadBeforeMe = mechs.filter((m) => m.ai && !m.alive).length
+      deadBeforeMe = mechs.filter((m) => m !== me && !m.alive).length
       activeEnd = mechs.filter((m) => m.ai && m.alive && m.ai.active).length
     }
     t += DT
     tick++
     if (mechs.filter((m) => m.alive).length <= 1 && SCENARIO !== "nav") break
   }
-  if (me.alive) deadBeforeMe = SCENARIO === "nav" ? 0 : mechs.filter((m) => m.ai && !m.alive).length
+  if (me.alive) deadBeforeMe = SCENARIO === "nav" ? 0 : mechs.filter((m) => m !== me && !m.alive).length
   times.sort((a, b) => a - b)
   return {
     score: deadBeforeMe, t, hp: Math.max(0, me.hp), kills, dealt, taken, zoneDmg, cubes: me.cubes, weapons: me.weapons.map((w) => w?.kind ?? "-").join("+"), stuck,
-    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2, src, activeEnd, killT,
+    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2, src, activeEnd, killT, pend: brain.powerEnded, cubesAtEnd,
   }
 }
 
@@ -1018,6 +1162,14 @@ console.log(
   for (const r of all) for (const [k, v] of Object.entries(r.src)) tot[k] = (tot[k] ?? 0) + v
   const allDmg = Object.entries(tot).filter(([k]) => k !== 'rear').reduce((a, [, v]) => a + v, 0)
   console.log(`damage taken by source: ${Object.entries(tot).filter(([k]) => k !== 'rear').sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${pct(v, allDmg)}%`).join(', ')} | from behind ${pct(tot.rear ?? 0, allDmg)}% | hunters on us at death ${mean((r) => r.activeEnd).toFixed(1)} | kill times ${[0, 1, 2, 3, 4, 5].map((i) => { const v = all.filter((r) => r.killT.length > i).map((r) => r.killT[i]); return v.length ? `#${i + 1}@${(v.reduce((a, b) => a + b, 0) / v.length).toFixed(0)}s(${v.length})` : '' }).join(' ')}`)
+}
+{
+  const why: Record<string, number[]> = {}
+  for (const r of all) {
+    const [k, at] = (r.pend || 'never').split('@')
+    ;(why[k] ??= []).push(parseFloat(at) || 0)
+  }
+  console.log(`build-up phase ended: ${Object.entries(why).map(([k, v]) => `${k} x${v.length} (avg ${(v.reduce((a, b) => a + b, 0) / v.length).toFixed(0)}s)`).join(', ')} | cubes when it ended ${mean((r) => Math.max(0, r.cubesAtEnd)).toFixed(1)}`)
 }
 console.log(`laser detail: released ${sum((r) => r.lz2.rel)} (hit ${sum((r) => r.lz2.relHit)}, wall in the way ${sum((r) => r.lz2.relBlocked)}, off aim ${sum((r) => r.lz2.relOffAim)}) | fired itself after the hold ${sum((r) => r.lz2.auto)} (hit ${sum((r) => r.lz2.autoHit)})`)
 console.log(
