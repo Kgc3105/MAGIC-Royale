@@ -39,6 +39,8 @@ const HUNT_DELAY = Number(args.get("delay") ?? 0)
 /** when every house bot joins the hunt regardless of kills (our guess at "late in the match") */
 const LATE_T = Number(args.get("late") ?? 255)
 const TRACE = args.has("trace")
+/** no lasers lie on the map or come out of crates: the matches in which the bot never finds one */
+const NOLASER = args.has("nolaser")
 
 const hello0: Hello = JSON.parse(gunzipSync(readFileSync(`${decodeURIComponent(KIT)}/check/stream.jsonl.gz`)).toString("utf8").split("\n")[0])
 hello0.map.dir = `${decodeURIComponent(KIT)}/arena`
@@ -455,7 +457,8 @@ function runMatch(seed: number): Result {
     return null
   }
   for (let i = 0; i < cfg.loot.floor_count; i++) {
-    const kind = kinds[Math.floor(rnd() * 3)]
+    let kind = kinds[Math.floor(rnd() * 3)]
+    if (NOLASER && kind === "laser") kind = i % 2 ? "mortar" : "lightning"
     const rs = rnd() < cfg.loot.floor_roof_fraction ? roofSpot() : null
     if (rs) pickups.push({ id: 8000 + i, kind, x: rs[0], y: rs[1], z: rs[2], hp: 0 })
     else {
@@ -1124,7 +1127,7 @@ function runMatch(seed: number): Result {
         const c = crates[i]
         crates.splice(i, 1)
         cubes.push({ id: nextId++, kind: "cube", x: c.x, y: c.y, z: c.z, hp: 0 })
-        if (rnd() < cfg.loot.crate_weapon_chance) pickups.push({ id: nextId++, kind: kinds[Math.floor(rnd() * 3)], x: c.x + 1, y: c.y, z: c.z, hp: 0 })
+        if (rnd() < cfg.loot.crate_weapon_chance) pickups.push({ id: nextId++, kind: ((k) => (NOLASER && k === "laser" ? "lightning" : k))(kinds[Math.floor(rnd() * 3)]), x: c.x + 1, y: c.y, z: c.z, hp: 0 })
       }
     }
     // supply drops

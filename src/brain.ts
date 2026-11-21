@@ -1101,7 +1101,11 @@ export class Brain {
           rmax = 60
         }
         if (k.weapons.includes("lightning") && c.sLight < 0) rmin = Math.max(rmin, 60)
-        if (k.hp < 0.3 * k.maxHp && c.hpFrac > 0.5) rmax = Math.min(rmax, 45)
+        // nearly dead: step in and finish it (not into a crowd)
+        if (k.hp < tv("finHp", 0.3) * k.maxHp && c.hpFrac > tv("finMy", 0.5) && c.threats.length <= tv("finN", 99)) {
+          rmax = Math.min(rmax, tv("finR", 45))
+          rmin = Math.min(rmin, tv("finMin", 999))
+        }
         rmax = Math.max(rmax, rmin + 15)
         const lost = t - this.lastSawTargetT > 4
         const inZone = dist2(k.x, k.y, zn.next_center[0], zn.next_center[1]) < zn.next_radius + 20 || t < zn.shrink_start - 25
