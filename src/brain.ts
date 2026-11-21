@@ -182,6 +182,8 @@ export class Brain {
   private hopFlyT = 0
   private hopFails = 0
   private fbOn = false
+  private nextJumpT = 0
+  private jumpT = -1e9
   private hopBan = -1e9
   private hopStartT = -1e9
   private hopSeenT = -1e9
@@ -1718,6 +1720,17 @@ export class Brain {
     if (c.evade && c.exposed && me.energy > 30 && !charging) boost = true
     out.move = [bx * mag, by * mag]
     out.boost = boost && (bx !== 0 || by !== 0)
+    // hop during a fight (fjump 1), or hop and fire the jets for a moment to climb (fjump 2): a
+    // shot led at a mech running on the ground passes under or over one that left it
+    if (tv("fjump", 0) > 0 && c.fight && c.exposed && !charging) {
+      if (me.grounded && t >= this.nextJumpT && me.energy > tv("fjumpE", 20)) {
+        out.jump = true
+        this.jumpT = t
+        this.nextJumpT = t + tv("fjumpEvery", 2) * (0.6 + 0.8 * this.rng())
+      } else if (!me.grounded && tv("fjump", 0) >= 2 && t - this.jumpT < tv("fjumpJet", 0.5) && me.energy > 10) {
+        out.boost = true
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------------- aim and fire
