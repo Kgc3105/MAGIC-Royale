@@ -659,12 +659,12 @@ export class Brain {
       // practice squad: they never fight each other, so a house bot only dies if we kill it.
       // Take the fight while healthy, break off when losing.
       if (!hide) {
-        if (nT > 0 && hpFrac < tv("evHp", 0.4) && !finishable) hide = true
+        if (nT > 0 && hpFrac < tv("evHp", 0) && !finishable) hide = true
         if (nT >= tv("evN", 6)) hide = true
         if (nT === 2 && hpFrac < tv("evHp2", 0.5)) hide = true
         if (unseenShooter && underFire && !tk0) hide = true
-        if (outgunned && hpFrac < tv("ogHp", 0.8) && !finishable) hide = true
-      } else if ((nT === 0 && (hpFrac > tv("exHp0", 0.75) || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > tv("exHp1", 0.85) && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
+        if (outgunned && hpFrac < tv("ogHp", 0) && !finishable) hide = true
+      } else if ((nT === 0 && (hpFrac > tv("exHp0", 0.5) || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > tv("exHp1", 0.5) && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
       fight = !hide && !!tk0 && (camp || (targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
     }
     if (king) hide = false
@@ -714,7 +714,7 @@ export class Brain {
       }
       if (calm) {
         const cr = this.cfg.crates
-        for (const it of obs.crates) consider({ id: it.id, kind: "crate", x: it.pos[0], y: it.pos[1], z: it.pos[2], vx: 0, vy: 0, vz: 0, r: cr.radius ?? 1.4, h: cr.height ?? 2.4, hp: it.hp ?? 300, maxHp: cr.hp ?? 300, weapons: [] }, tv("crateR", 150), 60)
+        for (const it of obs.crates) consider({ id: it.id, kind: "crate", x: it.pos[0], y: it.pos[1], z: it.pos[2], vx: 0, vy: 0, vz: 0, r: cr.radius ?? 1.4, h: cr.height ?? 2.4, hp: it.hp ?? 300, maxHp: cr.hp ?? 300, weapons: [] }, tv("crateR", 100), 60)
       }
     }
 
@@ -1074,7 +1074,7 @@ export class Brain {
     }
     // cubes lying around
     let best: Item | null = null
-    let bd = tv("cubeR", 90)
+    let bd = tv("cubeR", 130)
     for (const it of this.cubes.values()) {
       if (it.roof || !okSpot(it.x, it.y) || skip(it.id)) continue
       const d = dist2(x, y, it.x, it.y)
