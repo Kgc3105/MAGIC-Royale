@@ -64,7 +64,7 @@ export class Nav {
     let id = 0
     let bestSize = 0
     for (let s = 0; s < n; s++) {
-      if (comp[s] >= 0 || !ok(s)) continue
+      if (comp[s] !== -1 || !ok(s)) continue
       let head = 0
       let tail = 0
       bfsQ[tail++] = s
@@ -81,12 +81,17 @@ export class Nav {
             const ni = ci + di
             if (ni < 0 || ni >= gnx) continue
             const nb = nj * gnx + ni
-            if (comp[nb] >= 0 || !ok(nb)) continue
+            if (comp[nb] !== -1 || !ok(nb)) continue
             if (di !== 0 && dj !== 0 && (!ok(cj * gnx + ni) || !ok(nj * gnx + ci))) continue
             comp[nb] = id
             bfsQ[tail++] = nb
           }
         }
+      }
+      if (tail < 12) {
+        // a few stray cells on a bank or between walls are not somewhere to plan from
+        for (let k = 0; k < tail; k++) comp[bfsQ[k]] = -2
+        continue
       }
       if (tail > bestSize) {
         bestSize = tail
@@ -94,6 +99,7 @@ export class Nav {
       }
       id++
     }
+    for (let c = 0; c < n; c++) if (comp[c] === -2) comp[c] = -1
   }
 
   /** nearest cell that belongs to a walkable area, within maxRing cells, or -1 */
@@ -210,7 +216,7 @@ export class Nav {
           if (w.ohBase[idx] < 1e8) roofed = true
         }
         if (roofed) continue
-        const e = 1.5 * (Math.max(0, rise) + 3) + 0.85 * gap + 8
+        const e = 1.5 * (Math.max(0, rise) + 3) + 1.3 * gap + 8
         if (e > maxEnergy) continue
         const score = e + 0.35 * Math.hypot(cx - x, cy - y)
         if (score < bestScore) {
@@ -272,7 +278,7 @@ export class Nav {
           if (w.ohBase[idx] < 1e8) roofed = true
         }
         if (!roofed) {
-          const e = 1.5 * (Math.max(0, rise) + 3) + 0.85 * gap + 8
+          const e = 1.5 * (Math.max(0, rise) + 3) + 1.3 * gap + 8
           if (e <= maxEnergy) {
             const score = walk * 0.5 + e
             if (score < bestScore) {

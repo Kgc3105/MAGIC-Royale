@@ -182,6 +182,12 @@ export class Brain {
   private hopFlyT = 0
   private hopFails = 0
   private hopBan = -1e9
+  private hopStartT = -1e9
+  private hopSeenT = -1e9
+  private hopWalkBest = Infinity
+  private hopWalkT = 0
+  private hopWalkX = 0
+  private hopWalkY = 0
   /** the rooftop laser we are going up for */
   private roofItem: Item | null = null
   private scanStartT = 0
@@ -1016,6 +1022,25 @@ export class Brain {
       }
     }
 
+    // ---- no laser yet, and we know where one lies: go and get it, and do not let a lost contact or
+    // a dip in health turn us round half way. Without one we lose the gun fight anyway (matches
+    // that never find a laser score less than half of those that do); the torso keeps shooting.
+    if (c.sLaser < 0 && tv("seek", 1) > 0 && c.hpFrac > tv("seekHp", 0)) {
+      let sl: Item | null = null
+      let sd = tv("seekR", 250)
+      const strict = tv("seekCont", 1) > 0
+      for (const it of this.pickups.values()) {
+        if (it.kind !== "laser" || it.roof || skip(it.id) || !okSpot(it.x, it.y)) continue
+        const d = dist2(x, y, it.x, it.y)
+        if (d >= sd) continue
+        // not one a mech is standing on, or (strict) standing much nearer to than we are
+        if (c.threats.some((k) => { const kd = dist2(it.x, it.y, k.x, k.y); return kd < 20 || (strict && kd + 30 < d) })) continue
+        sd = d
+        sl = it
+      }
+      if (sl && chase(sl.id, sd, 12)) return { x: sl.x, y: sl.y, arrive: 1.2, why: "seek-laser", boost: c.threats.length > 0 && sd > 20 && me.energy > tv("seekBoost", 30), travel: true }
+    }
+
     // ---- power beats position. A laser is worth about a kill a match and every cube is 4% more HP
     // and damage, so with a mech about we still go for one that is close (the torso keeps shooting).
     if (c.threats.length > 0 && c.hpFrac > tv("grabHp", 0.35)) {
@@ -1439,6 +1464,19 @@ export class Brain {
       this.hopPlan = null
       return false
     }
+    if (this.hopTarget !== target || t - this.hopSeenT > 3) {
+      // a new crossing: start the clocks
+      this.hopStartT = t
+      this.hopWalkBest = Infinity
+      this.hopWalkT = t
+      this.hopPlan = null
+    }
+    this.hopSeenT = t
+    if (t - this.hopStartT > 40) {
+      // this is not working: leave it to ordinary movement for a while
+      this.hopBan = t + 25
+      return false
+    }
     if (!this.hopPlan || this.hopTarget !== target || t - this.hopPlanT > 6) {
       this.hopPlan = nav.hopPlan(x, y, target)
       this.hopTarget = target
@@ -1447,13 +1485,25 @@ export class Brain {
     const p = this.hopPlan
     if (!p) return false
     const dl = dist2(x, y, p.lx, p.ly)
-    if (dl > 2.5) {
+    // standing still for three seconds on the way to the launch point (a bank, a ledge in the way)?
+    if (!Number.isFinite(this.hopWalkBest) || dist2(x, y, this.hopWalkX, this.hopWalkY) > 2) {
+      this.hopWalkBest = dl
+      this.hopWalkX = x
+      this.hopWalkY = y
+      this.hopWalkT = t
+    }
+    const stalled = dl > 2.5 && t - this.hopWalkT > 3
+    if (stalled && dl > 18) {
+      this.hopBan = t + 20
+      return false
+    }
+    if (dl > 2.5 && !stalled) {
       this.move(obs, c, { x: p.lx, y: p.ly, arrive: 1, why: goal.why, boost: goal.boost && dl > 25, travel: true }, out)
       return true
     }
     out.move = [0, 0]
     out.boost = false
-    if (me.energy < Math.min((me.stats.energy ?? 100) - 4, p.energy + 6)) return true // wait for the jets
+    if (me.energy < Math.min((me.stats.energy ?? 100) - 4, p.energy + 6 + (stalled ? dl * 1.3 : 0))) return true // wait for the jets
     this.hopFly = true
     this.hopFlyT = t
     out.jump = true

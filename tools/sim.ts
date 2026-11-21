@@ -393,7 +393,7 @@ class Dummy {
 }
 
 // ------------------------------------------------------------------------------------------ match
-type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number>; src: Record<string, number>; activeEnd: number; killT: number[]; pend: string; cubesAtEnd: number; roofLaserSeenT: number }
+type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number>; src: Record<string, number>; activeEnd: number; killT: number[]; pend: string; cubesAtEnd: number; roofLaserSeenT: number; glSeenT: number; gl0: number }
 
 function runMatch(seed: number): Result {
   const rnd = mulberry32(seed * 7919 + 17)
@@ -551,6 +551,8 @@ function runMatch(seed: number): Result {
   let seenTicks = 0
   let laserT = -1
   let roofLaserSeenT = -1
+  let glSeenT = -1
+  const gl0 = Math.min(1e4, ...pickups.filter((q) => q.kind === "laser" && q.z - world.groundAt(q.x, q.y) <= 2.5).map((q) => Math.hypot(q.x - me.x, q.y - me.y)))
   let gs = 0, gh = 0, ls = 0, lh = 0, losT = 0, conT = 0
   const lz2 = { auto: 0, autoHit: 0, rel: 0, relHit: 0, relBlocked: 0, relOffAim: 0 }
   const src: Record<string, number> = {}
@@ -806,6 +808,7 @@ function runMatch(seed: number): Result {
       events = []
       beams = []
       if (laserT < 0 && me.weapons.some((w) => w?.kind === "laser")) laserT = t
+      if (laserT < 0 && glSeenT < 0 && obs.pickups.some((q) => q.kind === "laser" && q.pos[2] - world.groundAt(q.pos[0], q.pos[1]) <= 2.5)) glSeenT = t
       if (laserT < 0 && roofLaserSeenT < 0 && obs.pickups.some((q) => q.kind === "laser" && q.pos[2] - world.groundAt(q.pos[0], q.pos[1]) > 2.5)) roofLaserSeenT = t
       if (cubesAtEnd < 0 && brain.powerEnded) cubesAtEnd = me.cubes
       if (obsMechs.length) {
@@ -823,7 +826,7 @@ function runMatch(seed: number): Result {
       times.push(performance.now() - w0)
       modes[brain.mode] = (modes[brain.mode] ?? 0) + 1
       if (TRACE && tick % 20 === 0)
-        console.log(`t ${t.toFixed(1)} ${brain.mode.padEnd(11)} pos ${me.x.toFixed(0)},${me.y.toFixed(0)},${me.z.toFixed(0)} hp ${me.hp.toFixed(0)} en ${me.energy.toFixed(0)} cubes ${me.cubes} wp ${me.weapons.map((w) => w?.kind ?? "-").join("+")} see ${obsMechs.length} zone r ${lz.r.toFixed(0)} d ${(Math.hypot(me.x - lz.cx, me.y - lz.cy)).toFixed(0)}`)
+        console.log(`t ${t.toFixed(1)} ${brain.mode.padEnd(11)} pos ${me.x.toFixed(0)},${me.y.toFixed(0)},${me.z.toFixed(0)} hp ${me.hp.toFixed(0)} en ${me.energy.toFixed(0)} cubes ${me.cubes} wp ${me.weapons.map((w) => w?.kind ?? "-").join("+")} see ${obsMechs.length} zone r ${lz.r.toFixed(0)} d ${(Math.hypot(me.x - lz.cx, me.y - lz.cy)).toFixed(0)} gl ${Math.min(9999, ...pickups.filter((q) => q.kind === "laser" && q.z - world.groundAt(q.x, q.y) <= 2.5).map((q) => Math.hypot(q.x - me.x, q.y - me.y))).toFixed(0)} kl ${(() => { const B = brain as any; let bd = 9999, tag = "-"; for (const it of B.pickups.values()) { if (it.kind !== "laser" || it.roof) continue; const d = Math.hypot(it.x - me.x, it.y - me.y); if (d < bd) { bd = d; tag = `${(B.ignore.get(it.id) ?? -1) > t ? "ign" : "ok"}/${B.nav.areaAt(it.x, it.y, 5) === B.nav.areaAt(me.x, me.y, 4) ? "same" : "other"}/${Math.hypot(it.x - lz.cx, it.y - lz.cy) < lz.r - 6 ? "in" : "out"}` } } return `${bd.toFixed(0)} ${tag}` })()}`)
       // one-shot parts
       if (a.pick != null && pendingOffer) {
         const ch = pendingOffer.choices[clamp(a.pick | 0, 0, pendingOffer.choices.length - 1)]
@@ -1160,7 +1163,7 @@ function runMatch(seed: number): Result {
   times.sort((a, b) => a - b)
   return {
     score: deadBeforeMe, t, hp: Math.max(0, me.hp), kills, dealt, taken, zoneDmg, cubes: me.cubes, weapons: me.weapons.map((w) => w?.kind ?? "-").join("+"), stuck,
-    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2, src, activeEnd, killT, pend: brain.powerEnded, cubesAtEnd, roofLaserSeenT,
+    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2, src, activeEnd, killT, pend: brain.powerEnded, cubesAtEnd, roofLaserSeenT, glSeenT, gl0,
   }
 }
 
@@ -1172,7 +1175,7 @@ for (let k = 0; k < MATCHES; k++) {
   all.push(r)
   const top = Object.entries(r.modes).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([m, n]) => `${m}:${n}`).join(" ")
   console.log(
-    `seed ${String(seed).padStart(3)} | outlived ${String(r.score).padStart(2)} | died/ended t=${r.t.toFixed(0).padStart(3)}s hp ${r.hp.toFixed(0).padStart(4)} | kills ${r.kills} dealt ${r.dealt.toFixed(0)} taken ${r.taken.toFixed(0)} zone ${r.zoneDmg.toFixed(0)} | cubes ${r.cubes} ${r.weapons} | stuck ${r.stuck} | ms p99 ${r.msP99.toFixed(1)} max ${r.msMax.toFixed(1)}${r.err ? ` | ERRORS ${r.err}` : ""} | ${top}`,
+    `seed ${String(seed).padStart(3)} | outlived ${String(r.score).padStart(2)} | died/ended t=${r.t.toFixed(0).padStart(3)}s hp ${r.hp.toFixed(0).padStart(4)} | kills ${r.kills} dealt ${r.dealt.toFixed(0)} taken ${r.taken.toFixed(0)} zone ${r.zoneDmg.toFixed(0)} | cubes ${r.cubes} ${r.weapons} | stuck ${r.stuck} | ms p99 ${r.msP99.toFixed(1)} max ${r.msMax.toFixed(1)}${r.err ? ` | ERRORS ${r.err}` : ""} | ${top} | laser@${r.laserT.toFixed(0)} seen@${r.glSeenT.toFixed(0)} near0 ${r.gl0.toFixed(0)}`,
   )
 }
 const mean = (f: (r: Result) => number) => all.reduce((s, r) => s + f(r), 0) / Math.max(1, all.length)
