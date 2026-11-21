@@ -12,5 +12,5 @@ RUN bun build /bot/bot.ts --target=bun --outfile=/bot/bot.js
 # to miss a 50 ms answer. Compile on the main thread, skip the slowest compiler tier, one GC marker.
 ENV BUN_JSC_useConcurrentJIT=0 BUN_JSC_useFTLJIT=0 BUN_JSC_numberOfGCMarkers=1
 # Variant settings for this submission (see MECH_TUNE in src/brain.ts).
-ENV MECH_TUNE='{"salt":6}'
+ENV MECH_TUNE='{"salt":7,"fboost":1,"fboostLo":5,"fboostHi":30,"fboostCh":1}'
 ENTRYPOINT ["bun", "/bot/bot.js"]
