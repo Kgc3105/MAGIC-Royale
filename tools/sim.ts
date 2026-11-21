@@ -384,7 +384,7 @@ class Dummy {
 }
 
 // ------------------------------------------------------------------------------------------ match
-type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number }
+type Result = { score: number; t: number; hp: number; kills: number; dealt: number; taken: number; zoneDmg: number; cubes: number; weapons: string; stuck: number; msMax: number; msP99: number; err: number; modes: Record<string, number>; travelled: number; seen: number; laserT: number; gs: number; gh: number; ls: number; lh: number; losT: number; conT: number; lz2: Record<string, number> }
 
 function runMatch(seed: number): Result {
   const rnd = mulberry32(seed * 7919 + 17)
@@ -474,6 +474,9 @@ function runMatch(seed: number): Result {
   let believed: [number, number] = [me.x, me.y]
   let knownT = 0
   let seenTicks = 0
+  let laserT = -1
+  let gs = 0, gh = 0, ls = 0, lh = 0, losT = 0, conT = 0
+  const lz2 = { auto: 0, autoHit: 0, rel: 0, relHit: 0, relBlocked: 0, relOffAim: 0 }
   let decTicks = 0
   let stillTicks = 0
   let deadBeforeMe = 0
@@ -524,6 +527,8 @@ function runMatch(seed: number): Result {
     if (by && by.id === 0) {
       events.push({ type: "hit", target: v.id, amount: a, weapon })
       dealt += a
+      if (weapon === "gun") gh++
+      else if (weapon === "laser") lh++
     }
     if (v.hp <= 0) {
       v.alive = false
@@ -697,6 +702,11 @@ function runMatch(seed: number): Result {
       }
       events = []
       beams = []
+      if (laserT < 0 && me.weapons.some((w) => w?.kind === "laser")) laserT = t
+      if (obsMechs.length) {
+        conT++
+        if (obsMechs.some((o) => world.losClear(me.x, me.y, me.z + 7, o.pos[0], o.pos[1], o.pos[2] + 4.5))) losT++
+      }
       const w0 = performance.now()
       let a: BotAction
       try {
@@ -787,25 +797,62 @@ function runMatch(seed: number): Result {
             const bx = Math.cos(pp) * Math.cos(yy), by = Math.cos(pp) * Math.sin(yy), bz = Math.sin(pp)
             bullets.push({ id: nextId++, kind: "gun", by: m.id, x: m.x + ux * off, y: m.y + uy * off, z: mzl + uz * off, vx: bx * w.stats.speed, vy: by * w.stats.speed, vz: bz * w.stats.speed, left: w.stats.range, dmg: w.stats.damage * cubeMult(m) })
             w.ammo--
+            if (m.id === 0) gs++
             w.cooldown = w.stats.cooldown
             if (w.ammo <= 0) w.reload = w.stats.reload
           }
         } else if (w.kind === "laser") {
           let fireNow = false
+          let auto = false
           if (trig && w.cooldown <= 0) {
             w.charge += DT
-            if (w.charge >= w.stats.charge + w.stats.hold_s) fireNow = true
+            if (w.charge >= w.stats.charge + w.stats.hold_s) {
+              fireNow = true
+              auto = true
+            }
           } else if (w.charge > 0) {
             if (w.charge >= w.stats.min_charge) fireNow = true
             else w.charge += DT
           }
           if (fireNow) {
             const frac = w.stats.min_frac + (1 - w.stats.min_frac) * Math.min(1, w.charge / w.stats.charge)
+            if (m.id === 0) ls++
             const [v, dd] = rayHit(m, m.x, m.y, mzl, ux, uy, uz, w.stats.range)
             // our bot sees a beam when either end is in view; one that hits it always is
             if (m.id !== 0 && (v === me || Math.hypot(m.x - me.x, m.y - me.y) < cfg.vision.near_range))
               beams.push({ by: m.id, kind: "laser", path: [[m.x, m.y, mzl], [m.x + ux * dd, m.y + uy * dd, mzl + uz * dd]], age: 0.05 })
-            if (v && world.losClear(m.x, m.y, mzl, m.x + ux * dd, m.y + uy * dd, mzl + uz * dd)) {
+            const clearShot = !!v && world.losClear(m.x, m.y, mzl, m.x + ux * dd, m.y + uy * dd, mzl + uz * dd)
+            // a beam that meets no mech can still break a crate
+            let crateHit = false
+            if (!v) {
+              const hl = Math.hypot(ux, uy)
+              for (const c of crates) {
+                const rx = c.x - m.x, ry = c.y - m.y
+                const along = hl > 1e-6 ? (rx * ux + ry * uy) / hl : -1
+                if (along <= 0 || along / hl > w.stats.range) continue
+                if (Math.abs(rx * uy - ry * ux) / hl > (cfg.crates.radius ?? 1.4)) continue
+                const hz = mzl + uz * (along / hl)
+                if (hz < c.z || hz > c.z + (cfg.crates.height ?? 2.4)) continue
+                if (!world.losClear(m.x, m.y, mzl, c.x, c.y, hz)) continue
+                c.hp -= w.stats.damage * frac * cubeMult(m)
+                if (m.id === 0) events.push({ type: "hit", target: c.id, amount: w.stats.damage * frac, weapon: "laser" })
+                crateHit = true
+                break
+              }
+            }
+            if (m.id === 0 && !crateHit) {
+              // why our laser shots miss: fired itself after the hold ran out, wall in the way, or off aim
+              if (auto) {
+                lz2.auto++
+                if (clearShot) lz2.autoHit++
+              } else {
+                lz2.rel++
+                if (clearShot) lz2.relHit++
+                else if (v) lz2.relBlocked++
+                else lz2.relOffAim++
+              }
+            }
+            if (v && clearShot) {
               let dmg = w.stats.damage * frac * cubeMult(m)
               if (v.weapons.some((q) => q?.kind === "mortar")) dmg *= 1 + w.stats.cookoff
               hurt(v, dmg, "laser", m, m.x, m.y, t)
@@ -933,7 +980,7 @@ function runMatch(seed: number): Result {
   times.sort((a, b) => a - b)
   return {
     score: deadBeforeMe, t, hp: Math.max(0, me.hp), kills, dealt, taken, zoneDmg, cubes: me.cubes, weapons: me.weapons.map((w) => w?.kind ?? "-").join("+"), stuck,
-    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0,
+    msMax: times[times.length - 1] ?? 0, msP99: times[Math.floor(times.length * 0.99)] ?? 0, err, modes, travelled, seen: decTicks ? seenTicks / decTicks : 0, laserT, gs, gh, ls, lh, losT, conT, lz2,
   }
 }
 
@@ -949,6 +996,12 @@ for (let k = 0; k < MATCHES; k++) {
   )
 }
 const mean = (f: (r: Result) => number) => all.reduce((s, r) => s + f(r), 0) / Math.max(1, all.length)
+const sum = (f: (r: Result) => number) => all.reduce((a, r) => a + f(r), 0)
+const pct = (a: number, b: number) => ((100 * a) / Math.max(1, b)).toFixed(0)
 console.log(
-  `\n${SCENARIO}: ${all.length} matches | mean outlived ${mean((r) => r.score).toFixed(2)} | mean survival ${mean((r) => r.t).toFixed(0)}s | kills ${mean((r) => r.kills).toFixed(2)} | dealt ${mean((r) => r.dealt).toFixed(0)} taken ${mean((r) => r.taken).toFixed(0)} zone dmg ${mean((r) => r.zoneDmg).toFixed(0)} | cubes ${mean((r) => r.cubes).toFixed(1)} | in sight ${(100 * mean((r) => r.seen)).toFixed(0)}% | stuck ${mean((r) => r.stuck).toFixed(2)} | worst decision ${Math.max(...all.map((r) => r.msMax)).toFixed(1)} ms | errors ${all.reduce((s, r) => s + r.err, 0)}`,
+  `shooting: gun ${sum((r) => r.gh)}/${sum((r) => r.gs)} hits (${pct(sum((r) => r.gh), sum((r) => r.gs))}%), ${(sum((r) => r.gs) / all.length).toFixed(0)} shots a match | laser ${sum((r) => r.lh)}/${sum((r) => r.ls)} hits (${pct(sum((r) => r.lh), sum((r) => r.ls))}%), ${(sum((r) => r.ls) / all.length).toFixed(1)} shots a match | enemy listed ${(sum((r) => r.conT) / all.length / 10).toFixed(0)}s a match, clear line ${pct(sum((r) => r.losT), sum((r) => r.conT))}% of that`,
+)
+console.log(`laser detail: released ${sum((r) => r.lz2.rel)} (hit ${sum((r) => r.lz2.relHit)}, wall in the way ${sum((r) => r.lz2.relBlocked)}, off aim ${sum((r) => r.lz2.relOffAim)}) | fired itself after the hold ${sum((r) => r.lz2.auto)} (hit ${sum((r) => r.lz2.autoHit)})`)
+console.log(
+  `\n${SCENARIO}: ${all.length} matches | mean outlived ${mean((r) => r.score).toFixed(2)} | mean survival ${mean((r) => r.t).toFixed(0)}s | kills ${mean((r) => r.kills).toFixed(2)} | dealt ${mean((r) => r.dealt).toFixed(0)} taken ${mean((r) => r.taken).toFixed(0)} zone dmg ${mean((r) => r.zoneDmg).toFixed(0)} | cubes ${mean((r) => r.cubes).toFixed(1)} | laser ${(100 * mean((r) => (r.laserT >= 0 ? 1 : 0))).toFixed(0)}% @${(all.filter((r) => r.laserT >= 0).reduce((a, r) => a + r.laserT, 0) / Math.max(1, all.filter((r) => r.laserT >= 0).length)).toFixed(0)}s | in sight ${(100 * mean((r) => r.seen)).toFixed(0)}% | stuck ${mean((r) => r.stuck).toFixed(2)} | worst decision ${Math.max(...all.map((r) => r.msMax)).toFixed(1)} ms | errors ${all.reduce((s, r) => s + r.err, 0)}`,
 )

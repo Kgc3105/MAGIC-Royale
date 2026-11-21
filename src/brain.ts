@@ -51,6 +51,10 @@ type Ctx = {
   fight: boolean
   /** hide-first posture (free-for-all) rather than take-the-fight posture (practice squad) */
   ambush: boolean
+  /** sniper posture: we hold a laser, so fight from a corner at range and let them come to us */
+  camp: boolean
+  /** fight-from-cover mechanics are on (either of the two postures above) */
+  cover: boolean
   threats: Track[]
   target: Aimable | null
   targetLos: boolean
@@ -71,8 +75,13 @@ const UPGRADE_ORDER = [
   "lightning_efficiency", "lightning_range", "lightning_chain", "gun_mag", "gun_velocity", "gyros", "sensors", "laser_pierce",
   "mortar_reload", "mortar_splash", "mortar_velocity",
 ]
+const CAMP_DEFAULT = "0"
+/** keep charging the laser while running from several mechs; MECH_RUNCHARGE=0/1 overrides for local testing */
+const CHARGE_ON_RUN = ((typeof process !== "undefined" && process.env?.MECH_RUNCHARGE) || "1") === "1"
 /** "auto" picks the posture from what the match looks like; the others force one (for local testing) */
 const STANCE = (typeof process !== "undefined" && process.env?.MECH_STANCE) || "auto"
+/** sniper posture when holding a laser; MECH_CAMP=0/1 overrides for local testing */
+const CAMP = ((typeof process !== "undefined" && process.env?.MECH_CAMP) || CAMP_DEFAULT) === "1"
 const NDIR = 16
 const DIRX = new Float64Array(NDIR)
 const DIRY = new Float64Array(NDIR)
@@ -495,6 +504,7 @@ export class Brain {
     // a laser out-trades a gun at range: do not trade with one unless we hold one too
     const outgunned = !!tk0 && tk0.weapons.includes("laser") && sLaser < 0 && targetDist > 55
     const ambush = this.ambushStance()
+    const camp = !ambush && CAMP && sLaser >= 0
     const hurtByMech = this.lastHurtBy >= 0 && this.lastHurtBy < 100 && t - this.lastHurtT < 4
     let hide = this.evading
     let fight: boolean
@@ -520,7 +530,7 @@ export class Brain {
         if (unseenShooter && underFire && !tk0) hide = true
         if (outgunned && hpFrac < 0.8 && !finishable) hide = true
       } else if ((nT === 0 && (hpFrac > 0.75 || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > 0.85 && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
-      fight = !hide && !!tk0 && ((targetLos && targetDist <= 175) || targetDist <= 60 || hurtByMech)
+      fight = !hide && !!tk0 && (camp || (targetLos && targetDist <= 175) || targetDist <= 60 || hurtByMech)
     }
     if (king) hide = false
     this.evading = hide
@@ -558,7 +568,7 @@ export class Brain {
 
     // peek logic: want a line of fire when a weapon is ready, want to be hidden when none is
     let wantLos = 0
-    if (nT > 0 && tk0 && (ambush || fight)) {
+    if (nT > 0 && tk0 && (ambush || camp || fight)) {
       if (!fight) wantLos = -1.6
       else {
         let ready = false
@@ -566,7 +576,7 @@ export class Brain {
         const laser = sLaser >= 0 ? me.weapons[sLaser] : null
         const light = sLight >= 0 ? me.weapons[sLight] : null
         // how far each ready weapon can usefully reach: beyond that, wait behind cover
-        if (gun && (gun.ammo ?? 1) > 0 && (gun.reload ?? 0) <= 0.25 && (!ambush || targetDist <= Math.min((gun.stats.range ?? 230) - 10, (gun.stats.speed ?? 252) * 0.8))) ready = true
+        if (gun && (gun.ammo ?? 1) > 0 && (gun.reload ?? 0) <= 0.25 && (!(ambush || camp) || targetDist <= Math.min((gun.stats.range ?? 230) - 10, (gun.stats.speed ?? 252) * 0.8))) ready = true
         let laserHot = false
         if (laser && (laser.charge ?? 0) >= (laser.stats.charge ?? 0.75) - 0.3 && targetDist <= (laser.stats.range ?? 280) - 5) {
           ready = true
@@ -583,7 +593,7 @@ export class Brain {
       }
     }
 
-    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
+    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, camp, cover: ambush || camp, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
   }
 
   /** hide-first posture? Forced by MECH_STANCE=ambush|brawl, otherwise on once the match looks like a free-for-all. */
@@ -658,7 +668,7 @@ export class Brain {
       if (gw && chase(gw.id, dist2(x, y, gw.x, gw.y), 9)) return { x: gw.x, y: gw.y, arrive: 1.2, why: `grab-${gw.kind}`, boost: c.exposed && me.energy > 50, travel: true }
     }
 
-    if (!c.ambush) {
+    if (!c.cover) {
       // ---- practice posture: break off when losing, otherwise hold a range that suits our weapons
       if (c.evade) {
         const [cx, cy] = this.coverSpot(obs, c, false)
@@ -695,7 +705,7 @@ export class Brain {
     }
     // ---- free-for-all posture: get behind cover and deal with a mech from there. We never walk
     // at an enemy across open ground; it has to come to us, and shows itself when it does.
-    if (c.ambush && (c.evade || c.fight) && c.threats.length > 0) {
+    if (c.cover && (c.evade || c.fight) && c.threats.length > 0) {
       const k = c.fight ? c.target : null
       if (k && k.kind === "mech" && k.hp < 0.25 * k.maxHp && c.hpFrac > 0.5 && c.threats.length === 1 && c.targetDist < 130) {
         // one shot from dead and alone: go and finish it
@@ -703,7 +713,7 @@ export class Brain {
       }
       const [cx, cy] = this.coverSpot(obs, c, c.fight)
       const far = dist2(x, y, cx, cy) > 10
-      return { x: cx, y: cy, arrive: 1.5, why: c.fight ? "ambush" : "hide", boost: c.exposed && far && me.energy > (c.fight ? 45 : 25), travel: true }
+      return { x: cx, y: cy, arrive: 1.5, why: c.fight ? (c.camp ? "camp" : "ambush") : "hide", boost: c.exposed && far && me.energy > (c.fight ? 45 : 25), travel: true }
     }
     // just lost contact: stay put behind the same cover for a few seconds before wandering off
     if (t - this.lastThreatT < 6 && Number.isFinite(this.coverX) && t - this.coverT < 12 && dist2(x, y, this.coverX, this.coverY) < 40) {
@@ -1006,9 +1016,9 @@ export class Brain {
     const goalW = forced ? 4 : grabbing ? 2.5 : 1
     const coverW = forced ? 0.3 : grabbing ? 0.5 : 1
     const mechTarget = c.target && c.target.kind === "mech" ? c.target : null
-    const tk = c.ambush ? (c.fight || c.evade ? mechTarget : null) : c.fight ? mechTarget : null
+    const tk = c.cover ? (c.fight || c.evade ? mechTarget : null) : c.fight ? mechTarget : null
     // hide-first: side-step only while it can actually see us, and stand still behind cover
-    const jink = !tk ? 0 : c.ambush ? (c.targetLos ? (c.fight ? 0.7 : 0.4) : 0) : c.targetLos ? 0.7 : 0.2
+    const jink = !tk ? 0 : c.cover ? (c.targetLos ? (c.fight ? 0.7 : 0.4) : 0) : c.targetLos ? 0.7 : 0.2
     let sx = 0
     let sy = 0
     if (tk) {
@@ -1128,18 +1138,22 @@ export class Brain {
     // free-for-all: do not pick a fight with a distant mech that is leaving us alone
     const unprovoked = mechT && c.ambush && !c.fight && t - this.lastMechHurtT > 3 && T!.hp > 0.35 * T!.maxHp
     const holdFire = repairing || unprovoked
-    // a charging laser halves our speed: when running from several mechs keep the legs free
-    const mayCharge = !c.evade || c.threats.length <= 1
+    // a charging laser halves our speed, but in sparring the shots were worth far more than the
+    // lost metres, so keep charging on the run unless we are nearly dead
+    const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > 0.3)
 
     if (T) {
-      const cz = T.z + T.h * (T.aimFrac ?? 0.5)
-      const ext = (lat: number) => [T.x + T.vx * lat - x, T.y + T.vy * lat - y, cz + T.vz * lat - mz]
+      const frac = T.aimFrac ?? 0.5
+      const cz = T.z + T.h * frac
+      // where the target will be relative to our muzzle a moment from now: both of us are moving
+      const ext = (lat: number) => [T.x + (T.vx - me.vel[0]) * lat - x, T.y + (T.vy - me.vel[1]) * lat - y, cz + (T.vz - me.vel[2]) * lat - mz]
       const [dx, dy, dz] = ext(0.05)
       const dist = Math.hypot(dx, dy, dz)
       const dYaw = Math.atan2(dy, dx)
       const dPitch = Math.atan2(dz, Math.hypot(dx, dy))
-      const tolYaw = Math.atan2(T.r * 0.75, dist) + 0.004
-      const tolPitch = Math.atan2(T.h * 0.4, dist) + 0.004
+      const tolYaw = Math.atan2(T.r * 0.6, dist) + 0.002
+      // room above and below the aim point on its body (little above when we aim at the shoulders)
+      const tolPitch = Math.atan2(T.h * 0.8 * Math.min(frac, 1 - frac), dist) + 0.002
       const errYaw = Math.abs(wrap(dYaw - me.aim[0]))
       const errPitch = Math.abs(dPitch - me.aim[1])
       const los = c.targetLos
