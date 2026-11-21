@@ -30,14 +30,14 @@ type Cfg = Record<string, number>
 /** alternatives to try for each parameter (the default is whatever the bot does without an override) */
 const SPACE: Record<string, number[]> = {
   engR: [140, 210], engNear: [40, 90],
-  evHp: [0.3, 0.5], evN: [4], evHp2: [0.5, 0.8], exHp0: [0.6, 0.9], exHp1: [0.7], ogHp: [0.6, 0.95],
+  evHp: [0.3, 0.5], evN: [3, 5, 6], evHp2: [0.5, 0.8], exHp0: [0.6, 0.9], exHp1: [0.7], ogHp: [0.6, 0.95],
   lmin: [100, 150], lmax: [165, 199], gmin: [30, 60], gmax: [70, 110], kw: [1.5, 3.5], kboost: [0, 40],
   flipA: [0.3, 0.7], flipB: [0.4, 1.2], jinkLos: [0.4, 1.1], jinkNo: [0, 0.5], hideW: [0.5, 1.5], losW1: [0.8, 2.0],
-  dodgeW: [2, 7], dodgeR: [1, 3.5], smooth: [0, 0.4], h1: [0.3, 0.6],
-  tolYaw: [0.45, 0.8], lat: [0.05, 0.1], gunT: [0.6, 1.0], preCharge: [0.7, 3], runChargeHp: [0.15, 0.5], relIdle: [0.5, 0.9], relFight: [0.2, 0.6],
+  dodgeW: [4, 10, 14], dodgeR: [1, 3.5], smooth: [0, 0.4], h1: [0.3, 0.6],
+  tolYaw: [0.45, 0.8], lat: [0.05, 0.1], gunT: [0.6, 1.0], preCharge: [0.7, 3], runChargeHp: [0, 0.3], relIdle: [0.5, 0.9], relFight: [0.2, 0.6],
   tsD: [40, 100], tsHp: [0.7, 3], tsLos: [1.5, 4], tsStick: [0.2, 1.2], tsAtk: [0, 2],
   farmHp: [0.75], farmWait: [3], crateR: [100, 200], cubeR: [60, 130], grabR: [30, 70], grabLaser: [80, 170],
-  upg: [1, 2, 3], predAim: [1], drop: [1],
+  upg: [1, 2, 3], predAim: [0], drop: [1],
 }
 
 // ------------------------------------------------------------------ running the simulator

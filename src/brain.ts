@@ -660,8 +660,8 @@ export class Brain {
       // Take the fight while healthy, break off when losing.
       if (!hide) {
         if (nT > 0 && hpFrac < tv("evHp", 0.4) && !finishable) hide = true
-        if (nT >= tv("evN", 4)) hide = true
-        if (nT === 2 && hpFrac < tv("evHp2", 0.65)) hide = true
+        if (nT >= tv("evN", 6)) hide = true
+        if (nT === 2 && hpFrac < tv("evHp2", 0.5)) hide = true
         if (unseenShooter && underFire && !tk0) hide = true
         if (outgunned && hpFrac < tv("ogHp", 0.8) && !finishable) hide = true
       } else if ((nT === 0 && (hpFrac > tv("exHp0", 0.75) || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > tv("exHp1", 0.85) && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
@@ -1429,13 +1429,13 @@ export class Brain {
         const [mx, my] = pred(dx, dy, sp, sh.th)
         if (sh.land) {
           const d = dist2(mx, my, sh.lx, sh.ly)
-          if (d < sh.lr) s -= tv("dodgeW", 7) * sh.w * (1 - d / sh.lr)
+          if (d < sh.lr) s -= tv("dodgeW", 10) * sh.w * (1 - d / sh.lr)
         } else {
           const miss = Math.abs((mx - sh.px) * sh.uy - (my - sh.py) * sh.ux)
           const safe = c.radius + tv("dodgeR", 2)
           if (miss < safe) {
             const q = 1 - miss / safe
-            s -= tv("dodgeW", 7) * sh.w * q * q
+            s -= tv("dodgeW", 10) * sh.w * q * q
           }
         }
       }
@@ -1510,7 +1510,7 @@ export class Brain {
     const holdFire = repairing || unprovoked || pacing
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
-    const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > tv("runChargeHp", 0.15))
+    const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > tv("runChargeHp", 0))
 
     if (T) {
       const frac = T.aimFrac ?? 0.5
