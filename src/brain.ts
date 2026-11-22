@@ -111,6 +111,8 @@ const UPGRADE_ALT: string[][] = [
   ["plating", "armor", "laser_damage", "gun_damage", "gun_rate", "gun_mag", "laser_charge", "nanites", "servos", "jets", "reactor", "capacitor", "gun_velocity"],
   // 3: toughness, damage and magazine interleaved
   ["plating", "laser_damage", "armor", "gun_mag", "gun_damage", "gun_rate", "nanites", "laser_charge", "servos", "jets", "reactor", "capacitor", "gun_velocity"],
+  // 4: toughness, then laser output, then repair (the order the strongest open controller uses)
+  ["plating", "armor", "laser_damage", "laser_charge", "nanites", "gun_damage", "gun_rate", "lightning_efficiency", "lightning_range", "servos", "gun_mag", "gun_velocity", "gyros", "lightning_chain", "reactor", "capacitor", "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce"],
 ]
 const NDIR = 16
 const DIRX = new Float64Array(NDIR)
@@ -182,6 +184,7 @@ export class Brain {
   private hopFlyT = 0
   private hopFails = 0
   private fbOn = false
+  private loseAt = -1e9
   private nextJumpT = 0
   private jumpT = -1e9
   private hopBan = -1e9
@@ -704,6 +707,24 @@ export class Brain {
         if (outgunned && hpFrac < tv("ogHp", 0.8) && !finishable) hide = true
       } else if ((nT === 0 && (hpFrac > tv("exHp0", 0.75) || t - this.lastThreatT > 8)) || (nT === 1 && hpFrac > tv("exHp1", 0.85) && !unseenShooter && !outgunned) || (finishable && nT === 1)) hide = false
       fight = !hide && !!tk0 && (camp || (targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
+    }
+    // Outnumbered rule (tune "lose"): fall back to cover the moment the fight turns bad, keep
+    // shooting from there, and come straight back out when it stops being bad. No waiting to heal.
+    // Bad means: two mechs close by and we are under lrHp2 health, lrN or more close by and under
+    // lrHp3, or we are nearly dead and the target is healthier. A nearly dead target cancels it.
+    const loseRule = tv("lose", 0) > 0 && !ambush
+    if (loseRule) {
+      let near = 0
+      for (const k of threats) if (!k.phantom && k.seen >= t - 0.01 && dist2(x, y, k.x, k.y) < tv("lrNear", 160)) near++
+      let losing = (near >= 2 && hpFrac < tv("lrHp2", 0.55)) || (near >= tv("lrN", 3) && hpFrac < tv("lrHp3", 0.8))
+      if (tk0) {
+        const tf = tk0.hp / Math.max(1, tk0.maxHp)
+        if (hpFrac < 0.35 && tf > hpFrac + 0.1) losing = true
+        if (tf < 0.25 && hpFrac > 0.2 && near <= 2) losing = false
+      }
+      if (losing) this.loseAt = t
+      hide = t - this.loseAt < tv("lrHold", 1.5)
+      fight = !hide && !!tk0 && ((targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
     }
     if (king) hide = false
     const power = this.updatePower(obs, hpFrac, ambush, king)
@@ -1758,7 +1779,7 @@ export class Brain {
     // optional pacing: each kill brings another hunter, so after paceK kills wait for the first supply
     // drop (a full repair) before making more, unless the mech is nearly dead or on top of us
     const pacing = mechT && tv("paceK", 0) > 0 && this.myKills >= tv("paceK", 0) && this.dropsTaken === 0 && t < tv("paceT", 104) && !c.ambush && T!.hp > 0.3 * T!.maxHp && c.targetDist > 50 && c.hpFrac > 0.45
-    const holdFire = repairing || unprovoked || pacing
+    const holdFire = (repairing && tv("lose", 0) <= 0) || unprovoked || pacing
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
     const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > tv("runChargeHp", 0))
@@ -1820,7 +1841,7 @@ export class Brain {
           const inRange = dist <= (st.range ?? 280) - 3
           // charge ahead of time when it was just in view, or is walking up to our corner
           const closing = dist > 1 ? -(dx * T.vx + dy * T.vy) / dist : 0
-          const recently = t - this.lastSawTargetT < tv("preCharge", 1.5) || (dist < 70 && closing > 2)
+          const recently = t - this.lastSawTargetT < tv("preCharge", 1.5) || (dist < 70 && closing > 2) || (tv("lose", 0) > 0 && c.evade && t - this.lastSawTargetT < tv("lrPre", 2.5))
           let hold = false
           if (inRange && (ch > 0 || (wp.cooldown <= 0.05 && mayCharge && !holdFire)) && (los || recently || ch > 0)) hold = true
           if (ch > 0) {
