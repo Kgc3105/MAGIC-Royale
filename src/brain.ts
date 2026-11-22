@@ -1234,15 +1234,23 @@ export class Brain {
         const d = dist2(x, y, k.x, k.y)
         let rmin = tv("gmin", 45)
         let rmax = tv("gmax", 85)
+        // tune "gFarN": with the gun alone and this many mechs on us, stand off like a laser would. A house
+        // bot's gun lands a third as often at 180 m as at 70 m; ours, leading, loses far less.
+        const gFar = c.sLaser < 0 && c.threats.length >= tv("gFarN", 99)
+        if (gFar) {
+          rmin = tv("gFarMin", 150)
+          rmax = tv("gFarMax", 210)
+        }
         if (c.sLaser >= 0) {
           rmin = tv("lmin", 125)
           rmax = tv("lmax", 185)
-        } else if (c.sLight >= 0 && me.energy > 25 && c.threats.length <= tv("zN", 99) && !(tv("zNoL", 0) > 0 && k.weapons.includes("lightning"))) {
+        } else if (!gFar && c.sLight >= 0 && me.energy > 25 && c.threats.length <= tv("zN", 99) && !(tv("zNoL", 0) > 0 && k.weapons.includes("lightning"))) {
           // (tune zNoL: not against a mech that has lightning too: that duel is a coin flip, and the gun out-ranges it)
           // lightning in hand: step in and use it (tune zN: only while this few mechs are on us)
           rmin = tv("zmin", 12)
           rmax = tv("zmax", 36)
-        } else if (k.weapons.includes("laser")) {
+        } else if (!gFar && k.weapons.includes("laser") && tv("olOff", 0) <= 0) {
+          // it has a laser and we have none: get in close (tune olOff: do not; real house lasers are poor shots at range)
           rmin = 30
           rmax = 60
         }
