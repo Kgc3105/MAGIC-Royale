@@ -783,7 +783,7 @@ export class Brain {
       hide = false
       fight = false
       // still shoot back at a mech that is on top of us or already hitting us
-      const defend = !!tk0 && (hurtByMech || targetDist < tv("pDefend", 60))
+      const defend = !!tk0 && tv("pacif", 0) <= 0 && (hurtByMech || targetDist < tv("pDefend", 60))
       if (!defend) {
         target = null
         targetLos = false
@@ -1927,7 +1927,10 @@ export class Brain {
     // optional pacing: each kill brings another hunter, so after paceK kills wait for the first supply
     // drop (a full repair) before making more, unless the mech is nearly dead or on top of us
     const pacing = mechT && tv("paceK", 0) > 0 && this.myKills >= tv("paceK", 0) && this.dropsTaken === 0 && t < tv("paceT", 104) && !c.ambush && T!.hp > 0.3 * T!.maxHp && c.targetDist > 50 && c.hpFrac > 0.45
-    const holdFire = (repairing && tv("lose", 0) <= 0) || unprovoked || pacing
+    // tune "pacif": never fire at a mech until the last circle. Nobody we kill, nobody new hunting us:
+    // the whole match is spent keeping away from the one weakest hunter and staying whole.
+    const pacif = mechT && tv("pacif", 0) > 0 && !c.king && !c.ambush
+    const holdFire = (repairing && tv("lose", 0) <= 0) || unprovoked || pacing || pacif
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
     // charging halves our speed: not while a lightning carrier is close enough to run us down
