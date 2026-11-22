@@ -9,7 +9,8 @@
  *   node tools/sim.ts --scenario duel --skill hard --matches 10
  */
 import { readFileSync } from "node:fs"
-import { gunzipSync } from "node:zlib"
+import { gunzipSync, gzipSync } from "node:zlib"
+import { writeFileSync } from "node:fs"
 import type { BotAction, Config, Hello, Observation } from "../mechfight.ts"
 import { clamp, interceptTime, mulberry32, TAU, wrap } from "../src/aim.ts"
 import { Brain } from "../src/brain.ts"
@@ -40,6 +41,9 @@ const HUNT_DELAY = Number(args.get("delay") ?? 0)
 /** when every house bot joins the hunt regardless of kills (our guess at "late in the match") */
 const LATE_T = Number(args.get("late") ?? 255)
 const TRACE = args.has("trace")
+/** write the first match as a protocol stream (hello, every observation, end) for timing a built image: --dump file.jsonl.gz */
+const DUMP = args.get("dump") ?? ""
+const dumpLines: string[] = []
 /** run the Go controller instead of our own bot: --bot path/to/giddy.wasm [--benv "MECH_SQUAD=Finish=0;MECH_SALT=3"] */
 const BOT = args.get("bot") ?? ""
 const BENV: Record<string, string> = Object.fromEntries((args.get("benv") ?? "").split(";").filter(Boolean).map((kv) => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)] }))
@@ -275,9 +279,31 @@ for (const k of Object.keys(SKILLS)) {
   if (HMOD.lead != null) sk.lead = HMOD.lead > 0
 }
 
+/**
+ * --house real: house bots that fight the way the organisers' own do, measured from public matches
+ * (play.joinbuilders.org rooms list each mech's type; 18 matches of "house:expert", Nov 22):
+ *   gun: aim error about 0.05 rad, leads a moving target by about 0.7 of what is needed
+ *        (hits 75% inside 80 m, 45% at 80-100, 35% at 100-130, 18% at 130-170, 6% beyond);
+ *   second weapon picked up within seconds, any kind (laser 40%, lightning 38%, mortar 22%; 15% none);
+ *   laser released the moment it is full, aim error about 0.085 rad (56% inside 60 m, 26% at 60-100, 10% beyond);
+ *   holds about 100 m with a laser, 80 with a mortar, 70 with the gun alone; with lightning runs in to 25 m;
+ *   always moving (strafe flips every 0.4-1.7 s), in the air 28% of the time, backs off under 40% health.
+ * Only the expert was measured. --hskill '{"easy":2,"medium":1.6,"hard":1.25,"expert":1}' multiplies the aim
+ * error of each skill (a guess, to be set so that known bots score what they score on the board).
+ */
+const HOUSE = args.get("house") ?? "old"
+const HSKILL: Record<string, number> = { easy: 2, medium: 1.6, hard: 1.25, expert: 1, ...JSON.parse(args.get("hskill") ?? "{}") }
+/** --hwpn '{"none":0.15,"laser":0.4,"lightning":0.38,"mortar":0.22}': chance of no second weapon, then the mix of kinds */
+const HWPN: Record<string, number> = { none: 0.15, laser: 0.4, lightning: 0.38, mortar: 0.22, ...JSON.parse(args.get("hwpn") ?? "{}") }
+
 class Dummy {
   skill: (typeof SKILLS)[string]
   rnd: () => number
+  /** --house real state */
+  sig = 1
+  rush = false
+  radial = 0
+  noiseL = 0
   path: number[] = []
   pathT = -1e9
   strafe = 1
@@ -370,6 +396,7 @@ class Dummy {
       if (!out.move) out.move = dzn > zone.nr * 0.6 ? this.walkTo(m, zone.ncx + this.home[0] * zone.nr * 0.5, zone.ncy + this.home[1] * zone.nr * 0.5, t) : [0, 0]
       return out
     }
+    if (HOUSE === "real") return this.fightReal(m, tgt, t, out)
     const mz = m.z + m.stats.muzzle_height
     const cz = tgt.z + tgt.stats.height * 0.5
     const d = Math.hypot(tgt.x - m.x, tgt.y - m.y)
@@ -417,6 +444,90 @@ class Dummy {
       if (laser.charge > 0 && !hold) out.fire![1] = false
       if (borrowed && laser.charge > 0 && !hold) this.lgapUntil = t + (HMOD.lgap ?? 0)
     }
+    return out
+  }
+
+  /** the fight of a measured house bot (see HOUSE above) */
+  private fightReal(m: Mech, tgt: Mech, t: number, out: BotAction): BotAction {
+    const g = () => (this.rnd() + this.rnd() + this.rnd() + this.rnd() - 2) * 1.2247
+    const mz = m.z + m.stats.muzzle_height
+    const cz = tgt.z + tgt.stats.height * 0.5
+    const d = Math.max(0.5, Math.hypot(tgt.x - m.x, tgt.y - m.y))
+    const los = world.losClear(m.x, m.y, mz, tgt.x, tgt.y, cz)
+    const gun = m.weapons[0]
+    const w2 = m.weapons[1]
+    const kind2 = w2?.kind ?? ""
+    const hpFrac = m.hp / Math.max(1, m.stats.hp)
+    // ---- the range it holds
+    let want = kind2 === "laser" ? (HMOD.rLaser ?? 100) : kind2 === "mortar" ? (HMOD.rMortar ?? 80) : (HMOD.rGun ?? 70)
+    if (kind2 === "lightning") {
+      if (this.rush && m.energy < 12) this.rush = false
+      if (!this.rush && m.energy > 55) this.rush = true
+      want = this.rush ? 22 : 85
+    }
+    if (hpFrac < 0.4) want += 60
+    // ---- legs: never still; sideways with a pull toward that range; a hop every few seconds
+    const ux = (tgt.x - m.x) / d, uy = (tgt.y - m.y) / d
+    if (!out.move) {
+      if (t > this.flipT) {
+        this.strafe = -this.strafe
+        this.flipT = t + 0.4 + this.rnd() * 1.3
+        this.radial = (this.rnd() - 0.5) * 1.2
+      }
+      if (!los || d > want + 25) out.move = this.walkTo(m, tgt.x, tgt.y, t)
+      else {
+        const rad = clamp((d - want) / 20, -1, 1) + this.radial * 0.5
+        let px = -uy * this.strafe + ux * rad, py = ux * this.strafe + uy * rad
+        const pl = Math.hypot(px, py) || 1
+        px /= pl
+        py /= pl
+        if (npcNav.free(m.x + px * 5, m.y + py * 5)) out.move = [px, py]
+        else if (npcNav.free(m.x - uy * -this.strafe * 5, m.y + ux * -this.strafe * 5)) {
+          this.strafe = -this.strafe
+          out.move = [-uy * this.strafe, ux * this.strafe]
+        } else out.move = [ux * Math.sign(rad || 1), uy * Math.sign(rad || 1)]
+      }
+      out.boost = (!los || d > want + 60) && m.energy > (kind2 === "lightning" ? 70 : 30)
+      if (m.grounded && los && d < 220 && this.rnd() < (HMOD.jump ?? 0.038)) out.jump = true
+    }
+    // ---- aim: a partly led shot with a wandering error
+    if (t > this.noiseT) {
+      this.noise = g() * (HMOD.gsig ?? 0.05) * this.sig
+      this.noiseL = g() * (HMOD.lsigma ?? 0.085) * this.sig
+      this.noiseT = t + 0.2 + this.rnd() * 0.25
+    }
+    const laser = kind2 === "laser" ? w2 : null
+    const charging = !!laser && laser.charge > 0
+    let dx = tgt.x - m.x, dy = tgt.y - m.y, dz = cz - mz
+    const leadK = HMOD.leadK ?? 0.7
+    // mortar: every reload, tip the tube up for a lob at where the target is heading
+    const mortar = kind2 === "mortar" ? w2 : null
+    if (mortar && mortar.cooldown <= 0.35 && d > 30 && d < 190) {
+      const v = mortar.stats.speed, gr = mortar.stats.gravity
+      const th = 0.5 * Math.asin(clamp((gr * d) / (v * v), -1, 1))
+      const tf = d / Math.max(1, v * Math.cos(th))
+      const lx = dx + tgt.vx * tf * leadK, ly = dy + tgt.vy * tf * leadK
+      const yawM = Math.atan2(ly, lx) + this.noise
+      out.aim = [yawM, th]
+      out.fire![1] = mortar.cooldown <= 0 && Math.abs(wrap(yawM - m.yaw)) < 0.06 && Math.abs(th - m.pitch) < 0.05
+      return out
+    }
+    if (gun && !charging) {
+      const tl = interceptTime(dx, dy, dz, tgt.vx, tgt.vy, tgt.vz, gun.stats.speed)
+      if (tl > 0) {
+        dx += tgt.vx * tl * leadK
+        dy += tgt.vy * tl * leadK
+        dz += tgt.vz * tl * leadK
+      }
+    }
+    const yaw = Math.atan2(dy, dx) + (charging ? this.noiseL : this.noise)
+    const pitch = Math.atan2(dz, Math.hypot(dx, dy)) + (charging ? this.noiseL : this.noise) * 0.4
+    out.aim = [yaw, pitch]
+    const settled = Math.abs(wrap(yaw - m.yaw)) < 0.06
+    if (gun && los && d < gun.stats.range - 5 && settled) out.fire![0] = true
+    // laser: charge on sight, let go the moment it is full
+    if (laser && d < 250) out.fire![1] = laser.cooldown <= 0.05 && (los || laser.charge > 0) && laser.charge < laser.stats.charge + 0.03
+    if (kind2 === "lightning" && los && d < w2!.stats.range - 2) out.fire![1] = true
     return out
   }
 }
@@ -471,7 +582,16 @@ function runMatch(seed: number): Result {
     mechs[i].ai = new Dummy(sk, seed * 131 + i)
     const a = rnd() * TAU
     mechs[i].ai!.home = [Math.cos(a), Math.sin(a)]
-    if (SKILLS[sk].laser || LASERS === "all") mechs[i].weapons[1] = mkWpn("laser")
+    if (HOUSE === "real") {
+      // a measured house bot: any second weapon, picked up in the first seconds
+      mechs[i].ai!.sig = HSKILL[sk] ?? 1
+      const r3 = mulberry32((seed * 613 + i * 7919) >>> 0)
+      if (r3() >= HWPN.none) {
+        const tot = HWPN.laser + HWPN.lightning + HWPN.mortar
+        const q = r3() * tot
+        mechs[i].weapons[1] = mkWpn(NOLASER ? (q < tot / 2 ? "lightning" : "mortar") : q < HWPN.laser ? "laser" : q < HWPN.laser + HWPN.lightning ? "lightning" : "mortar")
+      }
+    } else if (SKILLS[sk].laser || LASERS === "all") mechs[i].weapons[1] = mkWpn("laser")
   }
   // loot
   const pickups: Loot[] = []
@@ -858,6 +978,7 @@ function runMatch(seed: number): Result {
       const w0 = performance.now()
       let a: BotAction
       try {
+        if (DUMP && seed === SEED0) dumpLines.push(JSON.stringify(obs))
         a = brain.act(obs)
       } catch (e) {
         if (err++ < 3) console.error(`seed ${seed} t ${t.toFixed(1)}: act threw`, e)
@@ -865,6 +986,11 @@ function runMatch(seed: number): Result {
       }
       times.push(performance.now() - w0)
       modes[brain.mode] = (modes[brain.mode] ?? 0) + 1
+      if (TRACE && tick % 20 === 0) {
+        // who is on us: distance, second weapon, and whether it has a line of fire
+        const on = mechs.filter((m) => m.ai && m.alive && m.ai.active).map((m) => ({ d: Math.hypot(m.x - me.x, m.y - me.y), w: (m.weapons[1]?.kind ?? "gun").slice(0, 2), los: world.losClear(m.x, m.y, m.z + 7, me.x, me.y, me.z + 4.5), hp: m.hp })).sort((p, q) => p.d - q.d)
+        console.log(`    hunters ${on.map((o) => `${o.d.toFixed(0)}${o.w}${o.los ? "*" : ""}(${(o.hp / 14).toFixed(0)}%)`).join(" ")}`)
+      }
       if (TRACE && tick % 20 === 0)
         console.log(`t ${t.toFixed(1)} ${brain.mode.padEnd(11)} pos ${me.x.toFixed(0)},${me.y.toFixed(0)},${me.z.toFixed(0)} hp ${me.hp.toFixed(0)} en ${me.energy.toFixed(0)} cubes ${me.cubes} wp ${me.weapons.map((w) => w?.kind ?? "-").join("+")} see ${obsMechs.length} zone r ${lz.r.toFixed(0)} d ${(Math.hypot(me.x - lz.cx, me.y - lz.cy)).toFixed(0)} gl ${Math.min(9999, ...pickups.filter((q) => q.kind === "laser" && q.z - world.groundAt(q.x, q.y) <= 2.5).map((q) => Math.hypot(q.x - me.x, q.y - me.y))).toFixed(0)} kl ${(() => { const B = brain as any; let bd = 9999, tag = "-"; for (const it of B.pickups.values()) { if (it.kind !== "laser" || it.roof) continue; const d = Math.hypot(it.x - me.x, it.y - me.y); if (d < bd) { bd = d; tag = `${(B.ignore.get(it.id) ?? -1) > t ? "ign" : "ok"}/${B.nav.areaAt(it.x, it.y, 5) === B.nav.areaAt(me.x, me.y, 4) ? "same" : "other"}/${Math.hypot(it.x - lz.cx, it.y - lz.cy) < lz.r - 6 ? "in" : "out"}` } } return `${bd.toFixed(0)} ${tag}` })()}`)
       // one-shot parts
@@ -1217,6 +1343,12 @@ for (let k = 0; k < MATCHES; k++) {
   console.log(
     `seed ${String(seed).padStart(3)} | outlived ${String(r.score).padStart(2)} | died/ended t=${r.t.toFixed(0).padStart(3)}s hp ${r.hp.toFixed(0).padStart(4)} | kills ${r.kills} dealt ${r.dealt.toFixed(0)} taken ${r.taken.toFixed(0)} zone ${r.zoneDmg.toFixed(0)} | cubes ${r.cubes} ${r.weapons} | stuck ${r.stuck} | ms p99 ${r.msP99.toFixed(1)} max ${r.msMax.toFixed(1)}${r.err ? ` | ERRORS ${r.err}` : ""} | ${top} | laser@${r.laserT.toFixed(0)} seen@${r.glSeenT.toFixed(0)} near0 ${r.gl0.toFixed(0)}`,
   )
+}
+if (DUMP) {
+  const hello = JSON.stringify({ ...hello0, slot: 0, seed: 0 })
+  const NL = String.fromCharCode(10)
+  writeFileSync(DUMP, gzipSync([hello, ...dumpLines, JSON.stringify({ type: "end", place: 1, kills: 0 })].join(NL) + NL))
+  console.log(`wrote ${dumpLines.length} observations to ${DUMP}`)
 }
 const mean = (f: (r: Result) => number) => all.reduce((s, r) => s + f(r), 0) / Math.max(1, all.length)
 const sum = (f: (r: Result) => number) => all.reduce((a, r) => a + f(r), 0)

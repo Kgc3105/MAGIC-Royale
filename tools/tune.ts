@@ -15,7 +15,8 @@ import { fileURLToPath } from "node:url"
 const args = new Map<string, string>()
 for (let i = 2; i < process.argv.length; i++) {
   const a = process.argv[i]
-  if (a.startsWith("--")) args.set(a.slice(2), process.argv[i + 1] && !process.argv[i + 1].startsWith("--") ? process.argv[++i] : "1")
+  if (a === "--simargs") args.set("simargs", process.argv[++i] ?? "")
+  else if (a.startsWith("--")) args.set(a.slice(2), process.argv[i + 1] && !process.argv[i + 1].startsWith("--") ? process.argv[++i] : "1")
 }
 const SIM = fileURLToPath(new URL("./sim.ts", import.meta.url))
 const WORKERS = Number(args.get("workers") ?? 12)
@@ -25,6 +26,8 @@ const BLOCK = 50
 const SCENARIO = args.get("scenario") ?? "gauntlet"
 const SEED_BASE = Number(args.get("seedbase") ?? 20000)
 const TOP = Number(args.get("top") ?? 6)
+/** extra simulator arguments for every run, e.g. --simargs "--house real" */
+const EXTRA = (args.get("simargs") ?? "").split(" ").filter(Boolean)
 
 type Cfg = Record<string, number>
 /** alternatives to try for each parameter (the default is whatever the bot does without an override) */
@@ -61,7 +64,7 @@ async function block(cfg: Cfg, seed: number, n: number): Promise<number[]> {
   await slot()
   try {
     return await new Promise<number[]>((resolve) => {
-      const a = [SIM, "--scenario", SCENARIO, "--matches", String(n), "--seed", String(seed), "--me", JSON.stringify(cfg)]
+      const a = [SIM, "--scenario", SCENARIO, "--matches", String(n), "--seed", String(seed), "--me", JSON.stringify(cfg), ...EXTRA]
       const p = spawn(process.execPath, a, { stdio: ["ignore", "pipe", "ignore"] })
       let out = ""
       p.stdout.on("data", (d) => (out += d))

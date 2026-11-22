@@ -67,6 +67,9 @@ type Ctx = {
   sLight: number
   sMortar: number
   exposed: boolean
+  /** the nearest mech in view that carries lightning (it has to get within 45 m to use it), and how far it is */
+  lightFoe: Track | null
+  lightD: number
 }
 
 /** how much we like holding each weapon (the gun is never dropped) */
@@ -650,6 +653,8 @@ export class Brain {
       if (k.id === this.targetId) s += tv("tsStick", 0.6)
       // same health, very different danger: a mech with a laser is the one to remove first
       if (k.kind === "mech" && k.weapons.includes("laser")) s += tv("tsLaser", 0)
+      // lightning never misses inside 45 m: the one running at us with it is the one to stop
+      if (k.kind === "mech" && k.weapons.includes("lightning") && d < tv("tsLightR", 110)) s += tv("tsLight", 0) * (1 - d / tv("tsLightR", 110))
       if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) s += tv("tsAtk", 1)
       const away = Math.abs(wrap(Math.atan2(y - k.y, x - k.x) - k.yaw)) > 1.3
       if (away && tv("tp", 0) > 0) s += 1.2 + (1 - k.hp / Math.max(1, k.maxHp))
@@ -804,7 +809,18 @@ export class Brain {
       }
     }
 
-    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, power, camp, cover: ambush || camp, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed }
+    let lightFoe: Track | null = null
+    let lightD = Infinity
+    for (const k of threats) {
+      if (k.phantom || t - k.seen > 1 || !k.weapons.includes("lightning")) continue
+      const d = dist2(x, y, k.x, k.y)
+      if (d < lightD) {
+        lightD = d
+        lightFoe = k
+      }
+    }
+
+    return { x, y, z, t, radius, height, mh, hpFrac, walk, zone, insideNext, mustGo, king, evade, fight, ambush, power, camp, cover: ambush || camp, threats, target, targetLos, targetDist, wantLos, sGun, sLaser, sLight, sMortar, exposed, lightFoe, lightD }
   }
 
   /**
@@ -1118,6 +1134,13 @@ export class Brain {
         const [cx, cy] = this.coverSpot(obs, c, false)
         return { x: cx, y: cy, arrive: 1.5, why: "evade", boost: c.exposed && me.energy > 30, travel: true }
       }
+      // a mech with lightning is harmless until it is within 45 m and deadly inside it (240 damage a
+      // second, no aiming). Running costs it the same energy its lightning needs, so backing away at
+      // a walk keeps it out or brings it in empty. Whoever we are shooting at, keep that one away.
+      if (c.fight && c.lightFoe && c.sLight < 0 && c.lightD < tv("ltKeep", 0)) {
+        const back = this.retreatPoint(obs, c, { ...c.lightFoe, kind: "mech" })
+        if (back) return { x: back[0], y: back[1], arrive: 2, why: "fight-back", boost: c.lightD < tv("ltBoost", 0) && me.energy > 45, travel: false }
+      }
       if (c.fight && c.target) {
         const k = c.target
         const d = dist2(x, y, k.x, k.y)
@@ -1133,7 +1156,7 @@ export class Brain {
           rmin = 30
           rmax = 60
         }
-        if (k.weapons.includes("lightning") && c.sLight < 0) rmin = Math.max(rmin, 60)
+        if (k.weapons.includes("lightning") && c.sLight < 0) rmin = Math.max(rmin, tv("ltMin", 60))
         // nearly dead: step in and finish it (not into a crowd)
         if (k.hp < tv("finHp", 0.3) * k.maxHp && c.hpFrac > tv("finMy", 0.5) && c.threats.length <= tv("finN", 99)) {
           rmax = Math.min(rmax, tv("finR", 45))
@@ -1668,6 +1691,7 @@ export class Brain {
     let best = -1e9
     let bx = 0
     let by = 0
+    const rearW = tv("rearW", 0)
     const pred = (dx: number, dy: number, sp: number, tau: number): [number, number] => {
       const ex = dx * sp - vx
       const ey = dy * sp - vy
@@ -1719,6 +1743,26 @@ export class Brain {
           if (tk && k.id === tk.id) continue
           if (++n > 6) break
           if (w.losClear(k.x, k.y, k.z + k.h * 0.89, p1x, p1y, g1)) s -= wgt
+        }
+      }
+      // a hit from behind does half as much again: prefer ground from which the others are in front
+      // of us while we face the target
+      if (rearW > 0 && tk && c.threats.length > 1) {
+        const fx = tk.x - p2x
+        const fy = tk.y - p2y
+        const fl = Math.hypot(fx, fy)
+        if (fl > 1) {
+          let n = 0
+          for (const k of c.threats) {
+            if (k.id === tk.id || k.phantom) continue
+            if (++n > 6) break
+            const kx = k.x - p2x
+            const ky = k.y - p2y
+            const kl = Math.hypot(kx, ky)
+            if (kl < 1 || kl > 170) continue
+            const cs = (fx * kx + fy * ky) / (fl * kl)
+            if (cs < 0.15) s -= rearW * (0.15 - cs)
+          }
         }
       }
       s += tv("smooth", 0.15) * (dx * this.lastDX + dy * this.lastDY)
@@ -1782,7 +1826,8 @@ export class Brain {
     const holdFire = (repairing && tv("lose", 0) <= 0) || unprovoked || pacing
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
-    const mayCharge = !c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > tv("runChargeHp", 0))
+    // charging halves our speed: not while a lightning carrier is close enough to run us down
+    const mayCharge = (!c.evade || c.threats.length <= 1 || (CHARGE_ON_RUN && c.hpFrac > tv("runChargeHp", 0))) && !(c.sLight < 0 && c.lightD < tv("ltNoCh", 0))
 
     if (T) {
       const frac = T.aimFrac ?? 0.5
