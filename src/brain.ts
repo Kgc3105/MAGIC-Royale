@@ -950,11 +950,28 @@ export class Brain {
     // what we can see from here counts as looked at
     const ci = Math.floor((x - w.bMinX) / G)
     const cj = Math.floor((y - w.bMinY) / G)
-    for (let dj = -2; dj <= 2; dj++) {
-      for (let di = -2; di <= 2; di++) {
-        const i = ci + di
-        const j = cj + dj
-        if (i >= 0 && j >= 0 && i < gw && j < gh) this.visitT[j * gw + i] = t
+    if (tv("explLos", 0) > 0) {
+      // only ground we have a line of sight to counts: what a building hides is still to be looked at
+      const ez = c.z + (obs.self.stats.eye_height ?? 8)
+      for (let dj = -5; dj <= 5; dj++) {
+        for (let di = -5; di <= 5; di++) {
+          const i = ci + di
+          const j = cj + dj
+          if (i < 0 || j < 0 || i >= gw || j >= gh) continue
+          const px = w.bMinX + (i + 0.5) * G
+          const py = w.bMinY + (j + 0.5) * G
+          const d = dist2(x, y, px, py)
+          if (d > 190) continue
+          if (d < 30 || w.losClear(x, y, ez, px, py, w.groundAt(px, py) + 1.5)) this.visitT[j * gw + i] = t
+        }
+      }
+    } else {
+      for (let dj = -2; dj <= 2; dj++) {
+        for (let di = -2; di <= 2; di++) {
+          const i = ci + di
+          const j = cj + dj
+          if (i >= 0 && j >= 0 && i < gw && j < gh) this.visitT[j * gw + i] = t
+        }
       }
     }
     if (Number.isFinite(this.exploreX) && t - this.exploreT < 10 && dist2(x, y, this.exploreX, this.exploreY) > 25 && ok(this.exploreX, this.exploreY)) return [this.exploreX, this.exploreY]
@@ -1146,6 +1163,18 @@ export class Brain {
         sl = it
       }
       if (sl && chase(sl.id, sd, 12)) return { x: sl.x, y: sl.y, arrive: 1.2, why: "seek-laser", boost: c.threats.length > 0 && sd > 20 && me.energy > tv("seekBoost", 30), travel: true }
+    }
+
+    // ---- tune "explN": no laser and none known, with only the first hunters on us (they are the
+    // weakest shots): keep going to look for one, torso still shooting, instead of standing to trade
+    // gun for gun. Without a laser the match is lost anyway; with one it is three times the score.
+    if (c.sLaser < 0 && c.threats.length > 0 && c.threats.length <= tv("explN", 0) && c.hpFrac > tv("explHp", 0.5) && t < tv("explT", 70) && !c.ambush && c.lightD > 70) {
+      let known = false
+      for (const it of this.pickups.values()) if (it.kind === "laser" && !it.roof) known = true
+      if (!known) {
+        const [ex, ey] = this.explorePoint(obs, c, c.threats, okSpot)
+        return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: false, travel: true }
+      }
     }
 
     // ---- power beats position. A laser is worth about a kill a match and every cube is 4% more HP
