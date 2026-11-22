@@ -861,6 +861,20 @@ export class Brain {
         if (!(adv >= tv("huntAdv", 1.25) && targetDist < tv("huntR", 130) && targetLos && hpFrac > 0.6)) fight = false
       }
     }
+    // tune "open": the first openT seconds. Start nothing without an edge (our laser against a mech
+    // without one, inside 130 m, us above 60%); hold fire on a mech that is only watching from
+    // beyond 85 m; shot at from 40 m or more without that edge, get behind cover (shooting back).
+    if (tv("open", 0) > 0 && !ambush && t < tv("openT", 24) && tk0 && !this.ttdOut) {
+      const k = tk0
+      const hb = this.hurtBy.get(k.id) ?? -1e9
+      const hit = t - hb < 4
+      const edge = sLaser >= 0 && !k.weapons.includes("laser") && targetDist < 130 && hpFrac > 0.6
+      if (!hit && targetDist >= 40 && !edge) fight = false
+      if (hit && targetDist >= 40 && !edge && tv("openCover", 1) > 0) {
+        hide = true
+        fight = false
+      }
+    }
     if (king) hide = false
     const power = this.updatePower(obs, hpFrac, ambush, king)
     if (power) {
@@ -2044,7 +2058,9 @@ export class Brain {
     // tune "pacif": never fire at a mech until the last circle. Nobody we kill, nobody new hunting us:
     // the whole match is spent keeping away from the one weakest hunter and staying whole.
     const pacif = mechT && tv("pacif", 0) > 0 && !c.king && !c.ambush
-    const holdFire = (repairing && tv("lose", 0) <= 0 && tv("ttd", 0) <= 0) || unprovoked || pacing || pacif
+    // the cautious opening (tune "open"): a mech only watching us from beyond 85 m is left alone
+    const openHold = mechT && tv("open", 0) > 0 && !c.ambush && t < tv("openT", 24) && !c.fight && t - this.lastMechHurtT > 3 && c.targetDist > 85
+    const holdFire = (repairing && tv("lose", 0) <= 0 && tv("ttd", 0) <= 0) || unprovoked || pacing || pacif || openHold
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
     // charging halves our speed: not while a lightning carrier is close enough to run us down
