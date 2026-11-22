@@ -258,6 +258,22 @@ const SKILLS: Record<string, { sigma: number; strafe: boolean; laser: boolean; r
   hard: { sigma: 0.008, strafe: true, laser: true, range: 110, lead: true, boost: false },
   expert: { sigma: 0.002, strafe: true, laser: true, range: 130, lead: true, boost: true },
 }
+/**
+ * Experiments with how the house bots fight (to find a model that matches real scores):
+ *   --hmod '{"sigma":0.5,"range":1.3,"strafe":1,"lead":1,"lsig":4,"lmax":70,"lgap":2}'
+ * sigma/range multiply every skill's aim noise / preferred range; strafe/lead force those on (1) or off (0);
+ * lsig multiplies the aim noise of a laser shot from a bot whose skill has no laser of its own (with --lasers all);
+ * lmax is the furthest such a bot will fire its laser; lgap is extra seconds it waits between laser shots.
+ */
+const HMOD: Record<string, number> = JSON.parse(args.get("hmod") ?? "{}")
+for (const k of Object.keys(SKILLS)) {
+  const sk = SKILLS[k] as { sigma: number; strafe: boolean; laser: boolean; range: number; lead: boolean; boost: boolean; own?: boolean }
+  sk.own = sk.laser
+  if (HMOD.sigma != null) sk.sigma *= HMOD.sigma
+  if (HMOD.range != null) sk.range *= HMOD.range
+  if (HMOD.strafe != null) sk.strafe = HMOD.strafe > 0
+  if (HMOD.lead != null) sk.lead = HMOD.lead > 0
+}
 
 class Dummy {
   skill: (typeof SKILLS)[string]
@@ -269,6 +285,7 @@ class Dummy {
   noise = 0
   noiseT = 0
   active = false
+  lgapUntil = 0
   home: [number, number] = [0, 0]
   search: [number, number] | null = null
   searchT = -1
@@ -386,17 +403,19 @@ class Dummy {
         dz += tgt.vz * tl
       }
     }
-    const yaw = Math.atan2(dy, dx) + this.noise
+    const borrowed = !!laser && !(this.skill as { own?: boolean }).own
+    const yaw = Math.atan2(dy, dx) + this.noise * (borrowed && laserHot ? (HMOD.lsig ?? 1) : 1)
     const pitch = Math.atan2(dz, Math.hypot(dx, dy))
     out.aim = [yaw, pitch]
     const tol = Math.atan2(tgt.stats.radius, Math.max(1, d)) + 0.01
     const onAim = Math.abs(wrap(yaw - m.yaw)) < tol
     if (gun && los && d < gun.stats.range - 5 && onAim) out.fire![0] = true
-    if (laser && d < laser.stats.range - 5) {
+    if (laser && d < (borrowed ? Math.min(HMOD.lmax ?? 1e9, laser.stats.range - 5) : laser.stats.range - 5) && !(borrowed && t < this.lgapUntil)) {
       let hold = los || laser.charge > 0
       if (laser.charge >= laser.stats.charge - 0.01 && los && Math.abs(wrap(Math.atan2(tgt.y - m.y, tgt.x - m.x) - m.yaw)) < tol) hold = false
       out.fire![1] = hold && laser.cooldown <= 0.05
       if (laser.charge > 0 && !hold) out.fire![1] = false
+      if (borrowed && laser.charge > 0 && !hold) this.lgapUntil = t + (HMOD.lgap ?? 0)
     }
     return out
   }
