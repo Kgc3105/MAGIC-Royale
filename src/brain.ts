@@ -116,6 +116,8 @@ const UPGRADE_ALT: string[][] = [
   ["plating", "laser_damage", "armor", "gun_mag", "gun_damage", "gun_rate", "nanites", "laser_charge", "servos", "jets", "reactor", "capacitor", "gun_velocity"],
   // 4: toughness, then laser output, then repair (the order the strongest open controller uses)
   ["plating", "armor", "laser_damage", "laser_charge", "nanites", "gun_damage", "gun_rate", "lightning_efficiency", "lightning_range", "servos", "gun_mag", "gun_velocity", "gyros", "lightning_chain", "reactor", "capacitor", "mortar_reload", "mortar_splash", "mortar_velocity", "sensors", "jets", "laser_pierce"],
+  // 5: toughness, then gun output before laser charge speed, repair late (the order the leading open bot uses)
+  ["plating", "armor", "lightning_efficiency", "laser_damage", "gun_rate", "gun_damage", "lightning_range", "laser_charge", "gun_velocity", "servos", "nanites", "gun_mag", "lightning_chain", "reactor", "capacitor", "mortar_reload", "mortar_splash", "mortar_velocity", "laser_pierce", "sensors", "gyros", "jets"],
 ]
 const NDIR = 16
 const DIRX = new Float64Array(NDIR)
@@ -573,7 +575,14 @@ export class Brain {
     const d = dist2(c.x, c.y, ncx, ncy)
     let hx = ncx
     let hy = ncy
-    if (d <= R) {
+    // tune "rim": wait near the edge of the next circle instead of its middle. From the middle the
+    // squad arrives from every side; with our back to the edge it can only come from in front.
+    const rim = z.next_radius >= 140 && !c.ambush ? tv("rim", 0) : 0
+    if (rim > 0 && d > 1) {
+      const want = clamp(d, z.next_radius * Math.max(0, rim - tv("rimBand", 0.2)), z.next_radius * rim)
+      hx = ncx + ((c.x - ncx) / d) * want
+      hy = ncy + ((c.y - ncy) / d) * want
+    } else if (d <= R) {
       hx = c.x
       hy = c.y
     } else if (R > 0) {
@@ -690,6 +699,17 @@ export class Brain {
       }
       if (los) exposed = true
       let s = -d / tv("tsD", 60) - (k.hp / Math.max(1, k.maxHp)) * tv("tsHp", 1.5) + (los ? tv("tsLos", 2.5) : 0)
+      if (tv("tsMode", 0) > 0) {
+        // tune "tsMode": one multiplicative score instead (near, in sight, shooting at us, hurt, its back to us)
+        let m = 1 / (1 + d / 60)
+        if (los) m *= 3
+        if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) m *= 1.6
+        m *= 1 + (1 - k.hp / Math.max(1, k.maxHp))
+        if (k.id === this.targetId) m *= 1.2
+        if (Math.abs(wrap(Math.atan2(y - k.y, x - k.x) - k.yaw)) > Math.PI / 2) m *= 1.25
+        if (sLaser >= 0 && k.weapons.includes("mortar")) m *= 1.3
+        s = Math.log(m)
+      }
       if (k.id === this.targetId) s += tv("tsStick", 0.6)
       // same health, very different danger: a mech with a laser is the one to remove first
       if (k.kind === "mech" && k.weapons.includes("laser")) s += tv("tsLaser", 0)
@@ -1264,6 +1284,25 @@ export class Brain {
         const lost = t - this.lastSawTargetT > 4
         const inZone = dist2(k.x, k.y, zn.next_center[0], zn.next_center[1]) < zn.next_radius + 20 || t < zn.shrink_start - 25
         if (d > rmax + 4 && !lost && inZone) return { x: k.x, y: k.y, arrive: rmax, why: "fight-close", boost: false, travel: true }
+        // tune "nearBack": with several on us, keep the range from the nearest of them, not only from the
+        // one we are shooting at (fraction of the band's near edge; sprint if it is inside nearSprint m)
+        const nb = tv("nearBack", 0)
+        if (nb > 0 && c.threats.length >= 2 && d >= rmin - 4) {
+          let kn: Track | null = null
+          let dn = rmin * nb
+          for (const q of c.threats) {
+            if (q.id === k.id || q.phantom || t - q.seen > 1) continue
+            const dq = dist2(x, y, q.x, q.y)
+            if (dq < dn) {
+              dn = dq
+              kn = q
+            }
+          }
+          if (kn) {
+            const back = this.retreatPoint(obs, c, { ...kn, kind: "mech" })
+            if (back) return { x: back[0], y: back[1], arrive: 2, why: "fight-back", boost: dn < tv("nearSprint", 70) && me.energy > 45, travel: false }
+          }
+        }
         if (d < rmin - 4 && d > 0.5) {
           const back = this.retreatPoint(obs, c, k)
           if (back) return { x: back[0], y: back[1], arrive: 2, why: "fight-back", boost: d < rmin - tv("kboost", 15) && me.energy > 45, travel: false }
