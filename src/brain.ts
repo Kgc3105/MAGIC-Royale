@@ -1126,7 +1126,7 @@ export class Brain {
     // a second without aiming, and each hit shuts our laser off for two seconds). Run: legs away at a
     // sprint, torso and gun still on it. It cannot zap past 45 m, and sprinting after us burns the
     // energy its lightning needs.
-    if (!c.ambush && c.lightFoe && c.sLight < 0 && c.lightD < tv("ltFlee", 0)) {
+    if (!c.ambush && c.lightFoe && (c.sLight < 0 || tv("ltFleeZ", 0) > 0) && c.lightD < tv("ltFlee", 0)) {
       const back = this.retreatPoint(obs, c, { ...c.lightFoe, kind: "mech" })
       if (back) return { x: back[0], y: back[1], arrive: 2, why: "flee-light", boost: me.energy > tv("ltFleeE", 12), travel: false }
     }
@@ -1162,7 +1162,8 @@ export class Brain {
         sd = d
         sl = it
       }
-      if (sl && chase(sl.id, sd, 12)) return { x: sl.x, y: sl.y, arrive: 1.2, why: "seek-laser", boost: c.threats.length > 0 && sd > 20 && me.energy > tv("seekBoost", 30), travel: true }
+      // (tune "rush": also sprint to it before anybody is on us: the opening seconds are the free ones)
+      if (sl && chase(sl.id, sd, 12)) return { x: sl.x, y: sl.y, arrive: 1.2, why: "seek-laser", boost: sd > 20 && ((c.threats.length > 0 && me.energy > tv("seekBoost", 30)) || (tv("rush", 0) > 0 && me.energy > tv("rushE", 40))), travel: true }
     }
 
     // ---- tune "explN": no laser and none known, with only the first hunters on us (they are the
@@ -1236,7 +1237,8 @@ export class Brain {
         if (c.sLaser >= 0) {
           rmin = tv("lmin", 125)
           rmax = tv("lmax", 185)
-        } else if (c.sLight >= 0 && me.energy > 25 && c.threats.length <= tv("zN", 99)) {
+        } else if (c.sLight >= 0 && me.energy > 25 && c.threats.length <= tv("zN", 99) && !(tv("zNoL", 0) > 0 && k.weapons.includes("lightning"))) {
+          // (tune zNoL: not against a mech that has lightning too: that duel is a coin flip, and the gun out-ranges it)
           // lightning in hand: step in and use it (tune zN: only while this few mechs are on us)
           rmin = tv("zmin", 12)
           rmax = tv("zmax", 36)
@@ -1244,7 +1246,7 @@ export class Brain {
           rmin = 30
           rmax = 60
         }
-        if (k.weapons.includes("lightning") && c.sLight < 0) rmin = Math.max(rmin, tv("ltMin", 60))
+        if (k.weapons.includes("lightning") && (c.sLight < 0 || tv("zNoL", 0) > 0)) rmin = Math.max(rmin, tv("ltMin", 60))
         // nearly dead: step in and finish it (not into a crowd)
         if (k.hp < tv("finHp", 0.3) * k.maxHp && c.hpFrac > tv("finMy", 0.5) && c.threats.length <= tv("finN", 99)) {
           rmax = Math.min(rmax, tv("finR", 45))
@@ -1333,12 +1335,12 @@ export class Brain {
     }
     if (look && (lookL >= 2 || !bw)) {
       const [ex, ey] = this.explorePoint(obs, c, [], okSpot)
-      return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: false, travel: true }
+      return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: tv("rush", 0) > 0 && me.energy > tv("rushE", 40), travel: true }
     }
     if (bw && chase(bw.id, dist2(x, y, bw.x, bw.y), 9)) return { x: bw.x, y: bw.y, arrive: 1.2, why: `get-${bw.kind}`, boost: false, travel: true }
     if (look) {
       const [ex, ey] = this.explorePoint(obs, c, [], okSpot)
-      return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: false, travel: true }
+      return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: tv("rush", 0) > 0 && me.energy > tv("rushE", 40), travel: true }
     }
 
     // crates: a cube each and maybe a weapon (only at full health: shooting stops our repair)
