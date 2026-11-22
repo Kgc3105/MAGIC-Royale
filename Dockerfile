@@ -1,14 +1,15 @@
-# Build from this folder: docker build -t magic-royale .
-# The match runs it with no network, a read-only root (writable /tmp), 1 CPU, 512 MB, and the map at /arena.
-# Pinned by digest so the final rebuild gets exactly the image this was tested on.
-FROM oven/bun:1.4.4-slim@sha256:1846adf22496bd711036aae8be147e57bdebbaea2e5264e3e0b5af1db187d9a4
-WORKDIR /bot
-COPY bot.ts mechfight.ts package.json ./
-COPY src ./src
-# Bundle to one file at build time: a broken import or syntax error fails the build, not the match.
-RUN bun build /bot/bot.ts --target=bun --outfile=/bot/bot.js
-# The match gives us one CPU. Left to itself the runtime compiles and collects garbage on extra
-# threads, which can use up that allowance and freeze the bot for tens of milliseconds, long enough
-# to miss a 50 ms answer. Compile on the main thread, skip the slowest compiler tier, one GC marker.
-ENV BUN_JSC_useConcurrentJIT=0 BUN_JSC_useFTLJIT=0 BUN_JSC_numberOfGCMarkers=1
-ENTRYPOINT ["bun", "/bot/bot.js"]
+# Variant of our entry built on the open MIT-licensed giddygiddyboy controller (see giddy/LICENSE and README).
+# Pinned by digest so the final rebuild gets exactly the toolchain this was tested with.
+FROM golang:1.26.1-bookworm@sha256:ab3d6955bbc813a0f3fdf220c1d817dd89c0b3f283777db8ece4a32fe7858edd AS build
+WORKDIR /src
+COPY giddy/go.mod ./
+COPY giddy/mech ./mech
+COPY giddy/cmd/bot ./cmd/bot
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /mechbot ./cmd/bot
+
+FROM scratch
+COPY --from=build /mechbot /mechbot
+COPY giddy/LICENSE /LICENSE.giddygiddyboy
+# Variant settings for this submission (see giddy/mech/tune.go).
+ENV MECH_SALT=0 MECH_SQUAD=""
+ENTRYPOINT ["/mechbot"]
