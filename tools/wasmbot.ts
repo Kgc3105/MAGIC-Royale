@@ -1,6 +1,7 @@
 /**
- * Runs the Go controller (giddy/, built to WebAssembly by docker/Dockerfile.wasm) inside the
- * simulator, so both bots can be measured on the same matches. Local testing only.
+ * Runs a bot built as a WebAssembly module (exports alloc/handle, one protocol line per call) inside
+ * the simulator, so another controller can be measured on the same matches as ours. Local testing
+ * only; no such module is part of this repository or of any submitted image.
  */
 import { readFileSync } from "node:fs"
 import { WASI } from "node:wasi"
