@@ -845,6 +845,22 @@ export class Brain {
       hide = this.ttdOut
       fight = !hide && !!tk && ((targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
     }
+    // tune "hunt": start a fight only with a mech that is on us (hit us in the last 4 s, within 40 m, or
+    // aiming at us), or one we clearly out-trade (advantage >= huntAdv) inside huntR with us above 60%.
+    // Otherwise leave it be and keep collecting.
+    if (tv("hunt", 0) > 0 && !ambush && fight && tk0) {
+      const k = tk0
+      const hb = this.hurtBy.get(k.id) ?? -1e9
+      const kt = this.tracks.get(k.id)
+      const aiming = !!kt && targetDist < 200 && Math.abs(wrap(Math.atan2(y - k.y, x - k.x) - kt.yaw)) < 0.12
+      const engaged = t - hb < 4 || targetDist < 40 || aiming
+      if (!engaged) {
+        const myDps = (sLaser >= 0 ? 200 : 130) * (1 + 0.04 * Math.min(me.cubes, 10))
+        const theirDps = 110 + (k.weapons.includes("laser") ? 90 : 0) + (k.weapons.includes("lightning") && targetDist < 55 ? 150 : 0)
+        const adv = (me.hp / theirDps) / Math.max(0.1, k.hp / myDps)
+        if (!(adv >= tv("huntAdv", 1.25) && targetDist < tv("huntR", 130) && targetLos && hpFrac > 0.6)) fight = false
+      }
+    }
     if (king) hide = false
     const power = this.updatePower(obs, hpFrac, ambush, king)
     if (power) {
