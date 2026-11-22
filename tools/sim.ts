@@ -358,7 +358,7 @@ class Dummy {
    * `seen`: some house bot can see the target right now (they share vision). Otherwise the hunter
    * only has `believed`, the last place the squad saw it, and searches around there.
    */
-  decide(m: Mech, tgt: Mech | null, t: number, zone: { cx: number; cy: number; r: number; ncx: number; ncy: number; nr: number; hurry: boolean }, seen = true, believed: [number, number] = [0, 0]): BotAction {
+  decide(m: Mech, tgt: Mech | null, t: number, zone: { cx: number; cy: number; r: number; ncx: number; ncy: number; nr: number; hurry: boolean }, seen = true, believed: number[] = [0, 0, -1e9]): BotAction {
     const out: BotAction = { fire: [false, false] }
     if (tgt && tgt.alive && this.active && !seen) {
       const dzn0 = Math.hypot(m.x - zone.ncx, m.y - zone.ncy)
@@ -382,6 +382,13 @@ class Dummy {
         }
       }
       out.move = this.walkTo(m, gx, gy, t)
+      // last seen up on a roof: go up and look (--house real; the real ones jet onto roofs)
+      const bd = Math.hypot(believed[0] - m.x, believed[1] - m.y)
+      if (HOUSE === "real" && (believed[2] ?? -1e9) - m.z > 4 && bd < (HMOD.climbR ?? 45) && !args.has("noclimb")) {
+        out.move = bd > 0.5 ? [(believed[0] - m.x) / bd, (believed[1] - m.y) / bd] : [0, 0]
+        out.jump = m.grounded && m.energy > 35
+        out.boost = !m.grounded && m.z < believed[2] + 1.5 && m.energy > 2
+      }
       const mv = Math.hypot(out.move[0], out.move[1])
       out.aim = [(mv > 0.1 ? Math.atan2(out.move[1], out.move[0]) : m.yaw + 0.3) + 0.9 * Math.sin(t * 1.1 + m.id), 0]
       return out
@@ -472,12 +479,19 @@ class Dummy {
       if (t > this.flipT) {
         this.strafe = -this.strafe
         this.flipT = t + 0.4 + this.rnd() * 1.3
-        this.radial = (this.rnd() - 0.5) * 1.2
+        this.radial = (this.rnd() - 0.5) * 1.2 * (HMOD.radj ?? 1)
       }
-      if (!los || d > want + 25) out.move = this.walkTo(m, tgt.x, tgt.y, t)
+      if (!los && tgt.z - m.z > 4 && d < (HMOD.climbR ?? 45) && !args.has("noclimb")) {
+        // the target is up on something and out of sight from down here: jet up after it, as the real ones do
+        out.move = [ux, uy]
+        out.jump = m.grounded && m.energy > 35
+        out.boost = !m.grounded && m.z < tgt.z + 1.5 && m.energy > 2
+      } else if (!los || d > want + 25) out.move = this.walkTo(m, tgt.x, tgt.y, t)
       else {
         const rad = clamp((d - want) / 20, -1, 1) + this.radial * 0.5
-        let px = -uy * this.strafe + ux * rad, py = ux * this.strafe + uy * rad
+        // measured: about 5 m/s of its 11.7 is sideways (median), the rest toward or away. --hmod side/radj set that mix.
+        const side = HMOD.side ?? 1
+        let px = -uy * this.strafe * side + ux * rad, py = ux * this.strafe * side + uy * rad
         const pl = Math.hypot(px, py) || 1
         px /= pl
         py /= pl
@@ -487,7 +501,8 @@ class Dummy {
           out.move = [-uy * this.strafe, ux * this.strafe]
         } else out.move = [ux * Math.sign(rad || 1), uy * Math.sign(rad || 1)]
       }
-      out.boost = (!los || d > want + 60) && m.energy > (kind2 === "lightning" ? 70 : 30)
+      const climbing = !los && tgt.z - m.z > 4 && d < (HMOD.climbR ?? 45) && !args.has("noclimb")
+      if (!climbing) out.boost = (!los || d > want + 60) && m.energy > (kind2 === "lightning" ? 70 : 30)
       if (m.grounded && los && d < 220 && this.rnd() < (HMOD.jump ?? 0.038)) out.jump = true
     }
     // ---- aim: a partly led shot with a wandering error
@@ -724,7 +739,7 @@ function runMatch(seed: number): Result {
   const times: number[] = []
   const modes: Record<string, number> = {}
   let lastPos: [number, number] = [me.x, me.y]
-  let believed: [number, number] = [me.x, me.y]
+  let believed: number[] = [me.x, me.y, me.z]
   let knownT = 0
   let seenTicks = 0
   let laserT = -1
@@ -900,7 +915,7 @@ function runMatch(seed: number): Result {
         }
       }
       if (seenNow) {
-        believed = [me.x, me.y]
+        believed = [me.x, me.y, me.z]
         knownT = t
       }
       const seen = seenNow || t - knownT < 1

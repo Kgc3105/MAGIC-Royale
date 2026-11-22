@@ -1967,9 +1967,13 @@ export class Brain {
           const [lx0, ly0, lz0] = ext(tv("lat", 0.075))
           const tl = interceptTime(lx0, ly0, lz0, T.vx, T.vy, T.vz, st.speed ?? 252)
           if (tl <= 0) continue
-          const lx = lx0 + T.vx * tl
-          const ly = ly0 + T.vy * tl
-          const lz = lz0 + T.vz * tl
+          // tune "leadTau": a house bot changes direction about once a second, so over a long flight it
+          // ends up nearer to where it is now than a straight-line lead says. Lead by tau*(1-exp(-t/tau)).
+          const tau = T.kind === "mech" ? tv("leadTau", 0) : 0
+          const te = tau > 0 ? tau * (1 - Math.exp(-tl / tau)) : tl
+          const lx = lx0 + T.vx * te
+          const ly = ly0 + T.vy * te
+          const lz = lz0 + T.vz * te
           const gy = Math.atan2(ly, lx)
           const gp = Math.atan2(lz, Math.hypot(lx, ly))
           const ready = (wp.ammo ?? 1) > 0 && (wp.reload ?? 0) <= 0
