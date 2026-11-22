@@ -11,5 +11,5 @@ FROM scratch
 COPY --from=build /mechbot /mechbot
 COPY giddy/LICENSE /LICENSE.giddygiddyboy
 # Variant settings for this submission (see giddy/mech/tune.go).
-ENV MECH_SALT=0 MECH_SQUAD=""
+ENV MECH_SALT=1 MECH_SQUAD=""
 ENTRYPOINT ["/mechbot"]
