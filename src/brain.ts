@@ -366,8 +366,48 @@ export class Brain {
     if (this.hop(obs, c, goal, out)) this.mode = "hop"
     else this.move(obs, c, goal, out)
     this.aimAndFire(obs, c, out)
+    this.skyLook(obs, c, out)
     this.loot(obs, c, out)
     return out
+  }
+
+  private skyAir = false
+  private skyStartT = 0
+  private skyNextT = 0
+  private skyYaw0 = 0
+  /**
+   * tune "sky": no laser, none known on the ground, nobody on us: jump and jet straight up for a
+   * moment while the torso turns a full circle. From 15-20 m up far more of the ground within sight
+   * is in view than from the street, and a match without a laser scores a third of one with.
+   */
+  private skyLook(obs: Observation, c: Ctx, out: BotAction) {
+    if (tv("sky", 0) <= 0 || c.ambush) return
+    const me = obs.self
+    const t = c.t
+    if (this.skyAir) {
+      const up = t - this.skyStartT
+      if ((me.grounded && up > 0.5) || up > 8) {
+        this.skyAir = false
+        return
+      }
+      // a mech coming into view ends the look, and the jets with it (a sprint command in the air is the jets)
+      const calm = c.threats.length === 0 && !c.mustGo
+      out.jump = me.grounded && up < 0.3
+      out.boost = !me.grounded && calm && me.energy > 8 && up < tv("skyUp", 1.6)
+      if (calm) {
+        out.aim = [wrap(this.skyYaw0 + (up + 0.1) * (me.stats.turn_rate ?? 4) * 0.95), 0]
+        out.fire = [false, false]
+      }
+      return
+    }
+    if (c.sLaser >= 0 || c.threats.length > 0 || c.mustGo || !me.grounded || me.energy < tv("skyE", 70) || t < this.skyNextT || t > tv("skyT", 45)) return
+    if (this.mode === "hop" || t - this.lastThreatT < 4) return
+    for (const it of this.pickups.values()) if (it.kind === "laser" && !it.roof) return
+    this.skyStartT = t
+    this.skyAir = true
+    out.jump = true
+    this.skyYaw0 = me.aim[0]
+    this.skyNextT = t + tv("skyEvery", 14)
   }
 
   // ---------------------------------------------------------------------------------------- memory
@@ -653,6 +693,10 @@ export class Brain {
       if (k.id === this.targetId) s += tv("tsStick", 0.6)
       // same health, very different danger: a mech with a laser is the one to remove first
       if (k.kind === "mech" && k.weapons.includes("laser")) s += tv("tsLaser", 0)
+      // no laser of our own: the mech that carries one drops it where it dies
+      if (k.kind === "mech" && sLaser < 0 && k.weapons.includes("laser")) s += tv("tsLaserNeed", 0)
+      // our laser does 60% more to a mech that carries a mortar: it dies in three beams, not five
+      if (k.kind === "mech" && sLaser >= 0 && k.weapons.includes("mortar")) s += tv("tsMortar", 0)
       // lightning never misses inside 45 m: the one running at us with it is the one to stop
       if (k.kind === "mech" && k.weapons.includes("lightning") && d < tv("tsLightR", 110)) s += tv("tsLight", 0) * (1 - d / tv("tsLightR", 110))
       if (k.id === this.lastHurtBy && t - this.lastHurtT < 4) s += tv("tsAtk", 1)
@@ -683,7 +727,8 @@ export class Brain {
     // stage switch: hunters with only a gun can be fought in the open (their fire is dodged at range);
     // once enough laser-armed ones are on us, fight from behind cover and lean out to shoot
     const laserFoes = tv("campL", 0) > 0 ? threats.filter((k) => k.weapons.includes("laser")).length : 0
-    const camp = !ambush && sLaser >= tv("campNeed", 0) && (CAMP || (tv("campL", 0) > 0 && laserFoes >= tv("campL", 0)))
+    // tune "camp": N > 0 fights from a corner (charge hidden, lean out, fire, lean back) while at most N mechs are on us
+    const camp = !ambush && sLaser >= tv("campNeed", 0) && (CAMP || (tv("camp", 0) > 0 && nT <= tv("camp", 0)) || (tv("campL", 0) > 0 && laserFoes >= tv("campL", 0)))
     const hurtByMech = this.lastHurtBy >= 0 && this.lastHurtBy < 100 && t - this.lastHurtT < 4
     let hide = this.evading
     let fight: boolean
@@ -791,8 +836,12 @@ export class Brain {
         const gun = sGun >= 0 ? me.weapons[sGun] : null
         const laser = sLaser >= 0 ? me.weapons[sLaser] : null
         const light = sLight >= 0 ? me.weapons[sLight] : null
+        // tune "peekL": from a corner with a laser, lean out only to fire it. A house bot needs 0.8 s in
+        // sight of us to charge its own and its bullets take a third of a second to arrive; the gun is
+        // not worth standing in the open for unless the mech is close
+        const laserOnly = camp && !!laser && tv("peekL", 0) > 0 && targetDist > tv("peekNear", 60)
         // how far each ready weapon can usefully reach: beyond that, wait behind cover
-        if (gun && (gun.ammo ?? 1) > 0 && (gun.reload ?? 0) <= 0.25 && (!(ambush || camp) || targetDist <= Math.min((gun.stats.range ?? 230) - 10, (gun.stats.speed ?? 252) * 0.8))) ready = true
+        if (!laserOnly && gun && (gun.ammo ?? 1) > 0 && (gun.reload ?? 0) <= 0.25 && (!(ambush || camp) || targetDist <= Math.min((gun.stats.range ?? 230) - 10, (gun.stats.speed ?? 252) * 0.8))) ready = true
         let laserHot = false
         if (laser && (laser.charge ?? 0) >= (laser.stats.charge ?? 0.75) - 0.3 && targetDist <= (laser.stats.range ?? 280) - 5) {
           ready = true
@@ -1056,6 +1105,15 @@ export class Brain {
       return { x: ex, y: ey, arrive: 8, why: "power-explore", boost: false, travel: true }
     }
 
+    // ---- tune "ltFlee": a mech with lightning that is nearly on us wins the trade outright (240 damage
+    // a second without aiming, and each hit shuts our laser off for two seconds). Run: legs away at a
+    // sprint, torso and gun still on it. It cannot zap past 45 m, and sprinting after us burns the
+    // energy its lightning needs.
+    if (!c.ambush && c.lightFoe && c.sLight < 0 && c.lightD < tv("ltFlee", 0)) {
+      const back = this.retreatPoint(obs, c, { ...c.lightFoe, kind: "mech" })
+      if (back) return { x: back[0], y: back[1], arrive: 2, why: "flee-light", boost: me.energy > tv("ltFleeE", 12), travel: false }
+    }
+
     // ---- a supply drop is a second life (full repair, full energy, 3 cubes): go for it under fire.
     // It only needs us alone in its ring for a few seconds; being shot at does not stop the capture.
     if ((DROP_UNDER_FIRE || tv("drop", 0) > 0) && c.threats.length > 0) {
@@ -1149,9 +1207,10 @@ export class Brain {
         if (c.sLaser >= 0) {
           rmin = tv("lmin", 125)
           rmax = tv("lmax", 185)
-        } else if (c.sLight >= 0 && me.energy > 25) {
-          rmin = 12
-          rmax = 36
+        } else if (c.sLight >= 0 && me.energy > 25 && c.threats.length <= tv("zN", 99)) {
+          // lightning in hand: step in and use it (tune zN: only while this few mechs are on us)
+          rmin = tv("zmin", 12)
+          rmax = tv("zmax", 36)
         } else if (k.weapons.includes("laser")) {
           rmin = 30
           rmax = 60
@@ -1235,7 +1294,23 @@ export class Brain {
       const g = roofLaser(tv("roofRq", 160))
       if (g) return g
     }
+    // tune "explL": no laser, none known on the ground, nobody about: go and look for one instead of
+    // farming here (a match without a laser scores a third of one with). 2 = before any other weapon.
+    const lookL = tv("explL", 0)
+    let look = false
+    if (lookL > 0 && quiet && c.sLaser < 0 && t < tv("explT", 70) && !c.evade && (!bw || bw.kind !== "laser")) {
+      look = true
+      for (const it of this.pickups.values()) if (it.kind === "laser" && !it.roof) look = false
+    }
+    if (look && (lookL >= 2 || !bw)) {
+      const [ex, ey] = this.explorePoint(obs, c, [], okSpot)
+      return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: false, travel: true }
+    }
     if (bw && chase(bw.id, dist2(x, y, bw.x, bw.y), 9)) return { x: bw.x, y: bw.y, arrive: 1.2, why: `get-${bw.kind}`, boost: false, travel: true }
+    if (look) {
+      const [ex, ey] = this.explorePoint(obs, c, [], okSpot)
+      return { x: ex, y: ey, arrive: 8, why: "look-laser", boost: false, travel: true }
+    }
 
     // crates: a cube each and maybe a weapon (only at full health: shooting stops our repair)
     if (quiet && me.cubes < 14 && c.hpFrac >= 0.9 && !c.evade) {
@@ -1664,7 +1739,7 @@ export class Brain {
     // the zone outranks cover: outside it we cannot repair and it only gets worse
     const forced = goal.why === "zone" || goal.why === "king"
     const grabbing = goal.why.startsWith("grab")
-    const goalW = forced ? 4 : grabbing ? 2.5 : goal.why === "fight-back" ? tv("kw", 2.5) : 1
+    const goalW = forced ? 4 : grabbing ? 2.5 : goal.why === "flee-light" ? 3.5 : goal.why === "fight-back" ? tv("kw", 2.5) : 1
     const coverW = forced ? 0.3 : grabbing ? 0.5 : 1
     const mechTarget = c.target && c.target.kind === "mech" ? c.target : null
     const tk = c.cover ? (c.fight || c.evade ? mechTarget : null) : c.fight ? mechTarget : null
@@ -1940,6 +2015,22 @@ export class Brain {
       }
     }
 
+    // tune "scanFarm": a crate or drone can wait two seconds; a hunter walking up behind us cannot.
+    // Break off shooting them for the regular look round.
+    if (haveAim && T && T.kind !== "mech" && c.threats.length === 0 && tv("scanFarm", 0) > 0) {
+      if (t >= this.nextScanT) {
+        this.scanStartT = t
+        this.scanUntil = t + 1.8
+        this.scanYaw0 = me.aim[0]
+        this.nextScanT = t + tv("scanEvery", 11)
+      }
+      if (t < this.scanUntil) {
+        yaw = this.scanYaw0 + (t - this.scanStartT + 0.1) * (S.turn_rate ?? 4) * 0.9
+        pitch = 0
+        fire[0] = false
+        fire[1] = false
+      }
+    }
     if (!haveAim) {
       // nothing to shoot: look where trouble is, else sweep so we spot loot and mechs
       const moving = Math.hypot(me.vel[0], me.vel[1]) > 2
@@ -1948,7 +2039,7 @@ export class Brain {
         this.scanStartT = t
         this.scanUntil = t + 1.8
         this.scanYaw0 = me.aim[0]
-        this.nextScanT = t + 11
+        this.nextScanT = t + tv("scanEvery", 11)
       }
       let recent: Track | null = null
       for (const k of this.tracks.values()) if (k.kind === "mech" && t - k.seen < 12 && (!recent || k.seen > recent.seen)) recent = k

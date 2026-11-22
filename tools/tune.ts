@@ -42,6 +42,11 @@ const SPACE: Record<string, number[]> = {
   farmHp: [0.75], farmWait: [3], crateR: [100, 200], cubeR: [60, 130], grabR: [30, 70], grabLaser: [80, 170],
   upg: [1, 2, 3], predAim: [0], drop: [1],
 }
+/** --space '{"gmin":[60,90],"rearW":[5,12]}' replaces the list above (a narrower search on more matches) */
+if (args.has("space")) {
+  for (const k of Object.keys(SPACE)) delete SPACE[k]
+  Object.assign(SPACE, JSON.parse(args.get("space")!))
+}
 
 // ------------------------------------------------------------------ running the simulator
 let running = 0

@@ -621,6 +621,24 @@ function runMatch(seed: number): Result {
       pickups.push({ id: 8000 + i, kind, x: px, y: py, z: world.groundAt(px, py), hp: 0 })
     }
   }
+  // a measured house bot took its second weapon off the ground near where it started: that one is gone
+  if (HOUSE === "real" && !args.has("keeploot")) {
+    for (let i = 1; i < mechs.length; i++) {
+      const w2 = mechs[i].weapons[1]
+      if (!w2) continue
+      let bi = -1
+      let bd = 400
+      for (let k = 0; k < pickups.length; k++) {
+        if (pickups[k].kind !== w2.kind) continue
+        const d = Math.hypot(pickups[k].x - mechs[i].x, pickups[k].y - mechs[i].y)
+        if (d < bd) {
+          bd = d
+          bi = k
+        }
+      }
+      if (bi >= 0) pickups.splice(bi, 1)
+    }
+  }
   for (let i = 0; i < (cfg.crates.count ?? 36); i++) {
     const [px, py] = freeSpot(zc[0], zc[1], cfg.zone.start_radius * 0.85)
     crates.push({ id: 1000 + i, kind: "crate", x: px, y: py, z: world.groundAt(px, py), hp: cfg.crates.hp ?? 300 })
@@ -1221,7 +1239,18 @@ function runMatch(seed: number): Result {
               bd = d
               best = v
             }
-            if (best) hurt(best, w.stats.damage * cubeMult(m), "lightning", m, m.x, m.y, t)
+            if (best) {
+              hurt(best, w.stats.damage * cubeMult(m), "lightning", m, m.x, m.y, t)
+              // short: a laser the victim holds loses its charge and cannot start one for short_s
+              if (HOUSE === "real") {
+                for (const q of best.weapons) {
+                  if (q?.kind !== "laser") continue
+                  q.charge = 0
+                  q.cooldown = Math.max(q.cooldown, w.stats.short_s ?? 2)
+                  if (best.id === 0) events.push({ type: "effect", effect: "short", by: m.id } as never)
+                }
+              }
+            }
           }
         } else if (w.kind === "mortar") {
           if (trig && w.cooldown <= 0) {
@@ -1276,6 +1305,15 @@ function runMatch(seed: number): Result {
             if (d > R + v.stats.radius) continue
             const f = 1 - (1 - cfg.weapons.mortar.splash_edge) * clamp(d / R, 0, 1)
             hurt(v, b.dmg * f * (v === by ? M.self_damage_mult : 1), "mortar", by, nx, ny, t)
+            // concussion: thrown away from the blast, energy drained, by the same falloff
+            if (HOUSE === "real" && v.alive) {
+              const kd = Math.max(0.5, d)
+              v.vx += ((v.x - nx) / kd) * cfg.weapons.mortar.knock * f
+              v.vy += ((v.y - ny) / kd) * cfg.weapons.mortar.knock * f
+              v.vz = Math.max(v.vz, cfg.weapons.mortar.knock_up * f)
+              v.grounded = false
+              v.energy = Math.max(0, v.energy - cfg.weapons.mortar.drain * f)
+            }
           }
         }
       }
