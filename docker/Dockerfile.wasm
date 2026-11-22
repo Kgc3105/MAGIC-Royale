@@ -1,0 +1,9 @@
+# Local testing only: builds the controller as a WebAssembly module for tools/sim.ts.
+FROM golang:1.26.1-bookworm@sha256:ab3d6955bbc813a0f3fdf220c1d817dd89c0b3f283777db8ece4a32fe7858edd AS build
+WORKDIR /src
+COPY giddy/go.mod ./
+COPY giddy/mech ./mech
+COPY giddy/cmd/wasm ./cmd/wasm
+RUN GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -trimpath -o /giddy.wasm ./cmd/wasm
+FROM scratch
+COPY --from=build /giddy.wasm /giddy.wasm

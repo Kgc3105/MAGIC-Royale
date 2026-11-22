@@ -15,6 +15,7 @@ import { clamp, interceptTime, mulberry32, TAU, wrap } from "../src/aim.ts"
 import { Brain } from "../src/brain.ts"
 import { Nav } from "../src/nav.ts"
 import { World, type Prism } from "../src/world.ts"
+import { WasmBot } from "./wasmbot.ts"
 
 // ------------------------------------------------------------------------------------------- args
 const args = new Map<string, string>()
@@ -39,6 +40,9 @@ const HUNT_DELAY = Number(args.get("delay") ?? 0)
 /** when every house bot joins the hunt regardless of kills (our guess at "late in the match") */
 const LATE_T = Number(args.get("late") ?? 255)
 const TRACE = args.has("trace")
+/** run the Go controller instead of our own bot: --bot path/to/giddy.wasm [--benv "MECH_SQUAD=Finish=0;MECH_SALT=3"] */
+const BOT = args.get("bot") ?? ""
+const BENV: Record<string, string> = Object.fromEntries((args.get("benv") ?? "").split(";").filter(Boolean).map((kv) => { const i = kv.indexOf("="); return [kv.slice(0, i), kv.slice(i + 1)] }))
 /** which house bot joins the hunt next: "skill" (weakest first, the model so far), "shuffle" (any skill at any time), "reverse" (strongest first) */
 const ORDER = args.get("order") ?? "skill"
 /** "all": every house bot carries a laser, whatever its skill */
@@ -503,7 +507,9 @@ function runMatch(seed: number): Result {
   // what-if switches: start the bot with cubes or a weapon to measure how much they are worth
   if (args.has("weapon")) me.weapons[1] = mkWpn(args.get("weapon")!)
   // --me '{"key":value}' tunes only our bot; --stance forces its posture
-  const brain = new Brain({ ...hello0, slot: 0, seed: seed * 2654435761 }, { world, nav: new Nav(world) }, { tune: args.has("me") ? JSON.parse(args.get("me")!) : undefined, stance: args.get("stance") })
+  const brain = BOT
+    ? (new WasmBot(BOT, hello0.map.dir, { ...hello0, slot: 0, seed: (seed * 2654435761) >>> 0 }, BENV) as unknown as Brain)
+    : new Brain({ ...hello0, slot: 0, seed: seed * 2654435761 }, { world, nav: new Nav(world) }, { tune: args.has("me") ? JSON.parse(args.get("me")!) : undefined, stance: args.get("stance") })
   const bullets: Bullet[] = []
   let beams: Observation["beams"] = []
   let events: Observation["events"] = []

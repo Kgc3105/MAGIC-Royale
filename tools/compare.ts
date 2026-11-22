@@ -36,7 +36,9 @@ async function block(cfg: string, seed: number, n: number): Promise<number[]> {
   await slot()
   try {
     return await new Promise<number[]>((resolve) => {
-      const p = spawn(process.execPath, [SIM, "--scenario", SCENARIO, "--matches", String(n), "--seed", String(seed), "--me", cfg, ...EXTRA], { stdio: ["ignore", "pipe", "ignore"] })
+      // a config that starts with "@" is raw simulator arguments (e.g. "@--bot giddy.wasm --benv MECH_SALT=1")
+      const own = cfg.startsWith("@") ? cfg.slice(1).split(" ").filter(Boolean) : ["--me", cfg]
+      const p = spawn(process.execPath, [SIM, "--scenario", SCENARIO, "--matches", String(n), "--seed", String(seed), ...own, ...EXTRA], { stdio: ["ignore", "pipe", "ignore"] })
       let out = ""
       p.stdout.on("data", (d) => (out += d))
       p.on("close", () => resolve([...out.matchAll(/^seed\s+\d+ \| outlived\s+(\d+)/gm)].map((m) => Number(m[1]))))
