@@ -190,6 +190,11 @@ export class Brain {
   private hopFails = 0
   private fbOn = false
   private loseAt = -1e9
+  /** damage taken from weapons, as [t, amount, t, amount, ...] (tune "ttd") */
+  private dmgLog: number[] = []
+  private ttdOut = false
+  private ttdT = -1e9
+  private ttdCorner = -1e9
   private nextJumpT = 0
   private jumpT = -1e9
   private hopBan = -1e9
@@ -481,6 +486,7 @@ export class Brain {
     for (const e of obs.events) {
       if (e.type === "damaged") {
         if (e.weapon !== "zone") {
+          this.dmgLog.push(t, e.amount ?? 0)
           this.lastHurtT = t
           this.lastHurtBy = e.by ?? -1
           if (e.bearing != null) {
@@ -795,6 +801,49 @@ export class Brain {
       if (losing) this.loseAt = t
       hide = t - this.loseAt < tv("lrHold", 1.5)
       fight = !hide && !!tk0 && ((targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
+    }
+    // tune "ttd": leave a fight on how fast we are dying, then repair before coming back.
+    // Several on us: go when we would be dead within 10 s (and are under 80%), or under 45% and dead
+    // within 20 s. One on us: only when clearly losing the duel and it is not on top of us. Come back
+    // at 85% (75% once nobody is on us), sooner if the fight turns winnable, and never walk away from
+    // a mech that one more burst kills.
+    if (tv("ttd", 0) > 0 && !ambush) {
+      while (this.dmgLog.length && this.dmgLog[0] < t - 3) this.dmgLog.splice(0, 2)
+      let recent = 0
+      for (let i = 1; i < this.dmgLog.length; i += 2) recent += this.dmgLog[i]
+      const rate = recent / 3
+      const ttd = me.hp / Math.max(rate, 1)
+      let nEng = 0
+      for (const k of threats) {
+        if (k.phantom) continue
+        const hb = this.hurtBy.get(k.id) ?? -1e9
+        if (t - hb < 4 || dist2(x, y, k.x, k.y) < 40) nEng++
+      }
+      const myDps = (sLaser >= 0 ? 200 : 130) * (1 + 0.04 * Math.min(me.cubes, 10))
+      const tk = tk0
+      const adv = tk && rate > 1 ? ttd / Math.max(0.1, tk.hp / myDps) : 10
+      const danger = nEng > 0 || t - this.lastMechHurtT < 3
+      const leaveTTD = tv("ttdLeave", 10)
+      if (this.ttdOut) {
+        const winnable = adv > tv("ttdWin", 1.25)
+        const seen = !!tk && targetLos && targetDist < 45 && t - this.ttdT > 2 && nEng <= 1 && adv > 0.35
+        if ((hpFrac >= tv("ttdBack", 0.85) && (!danger || winnable)) || (!danger && hpFrac >= tv("ttdBack", 0.85) - 0.1) || (winnable && hpFrac > 0.3 && nEng <= 1 && !!tk) || seen) {
+          this.ttdOut = false
+          if (seen) this.ttdCorner = t
+        }
+      } else if (danger && t - this.ttdCorner > 4) {
+        let leave = false
+        if (nEng >= 2) leave = (ttd < leaveTTD && hpFrac < 0.8) || (hpFrac < tv("ttdHp", 0.45) && ttd < 2 * leaveTTD)
+        else if (tk) leave = adv < tv("ttdDuel", 0.5) && targetDist > 30 && ttd < 25
+        else leave = t - this.lastHurtT < 3 && (ttd < 1.5 * leaveTTD || hpFrac < 0.6)
+        if (leave) {
+          this.ttdOut = true
+          this.ttdT = t
+        }
+      }
+      if (tk && targetLos && tk.hp < myDps * 1.2 + 40 && hpFrac > 0.12) this.ttdOut = false
+      hide = this.ttdOut
+      fight = !hide && !!tk && ((targetLos && targetDist <= tv("engR", 175)) || targetDist <= tv("engNear", 60) || hurtByMech)
     }
     if (king) hide = false
     const power = this.updatePower(obs, hpFrac, ambush, king)
@@ -1979,7 +2028,7 @@ export class Brain {
     // tune "pacif": never fire at a mech until the last circle. Nobody we kill, nobody new hunting us:
     // the whole match is spent keeping away from the one weakest hunter and staying whole.
     const pacif = mechT && tv("pacif", 0) > 0 && !c.king && !c.ambush
-    const holdFire = (repairing && tv("lose", 0) <= 0) || unprovoked || pacing || pacif
+    const holdFire = (repairing && tv("lose", 0) <= 0 && tv("ttd", 0) <= 0) || unprovoked || pacing || pacif
     // a charging laser halves our speed, but in sparring the shots were worth far more than the
     // lost metres, so keep charging on the run unless we are nearly dead
     // charging halves our speed: not while a lightning carrier is close enough to run us down
